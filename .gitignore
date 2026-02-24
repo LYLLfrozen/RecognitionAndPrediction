@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 模型文件（太大）
+# model/saved_models/*.pth
+# model/saved_models/*.keras
+
+# 数据文件
+# data/processed_data/*.npy
+# data/raw_data/*.gz
+
+# 日志和临时文件
+*.log
+*.tmp
+temp/
+tmp/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 测试覆盖率
+.coverage
+htmlcov/
+
+# 图表文件（如果不需要版本控制）
+# *.png
+# *.jpg

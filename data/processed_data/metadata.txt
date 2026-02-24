@@ -1,0 +1,11 @@
+train_shape: (494021, 1, 11, 11)
+test_shape: (311029, 1, 11, 11)
+image_size: 11
+n_train_samples: 494021
+n_test_samples: 311029
+n_train_labels: 5
+n_test_labels: 5
+train_label_distribution: {'probe': 4107, 'normal': 97278, 'u2r': 52, 'dos': 391458, 'r2l': 1126}
+test_label_distribution: {'probe': 2377, 'normal': 79322, 'u2r': 39, 'dos': 223298, 'r2l': 5993}
+value_range: [0.0, 1.0]
+processor_stats: {'image_size': 11, 'n_features': 121, 'zero_cols_count': 2, 'categorical_encoders': {'protocol_type': 3, 'service': 66, 'flag': 11}, 'is_fitted': True}
