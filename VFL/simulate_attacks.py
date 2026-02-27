@@ -8,7 +8,17 @@ import time
 import random
 import sys
 import socket
+import os
 from scapy.all import IP, TCP, UDP, ICMP, send, conf  # type: ignore
+
+# Windows兼容性设置
+if os.name == 'nt':
+    try:
+        # 在Windows上使用L3 socket以避免接口问题
+        conf.L3socket = conf.L3socket
+        print("检测到Windows系统，使用L3 socket模式")
+    except:
+        pass
 
 def syn_flood(target_ip, port, count):
     """
@@ -18,26 +28,73 @@ def syn_flood(target_ip, port, count):
     print(f"\n[DoS] 正在启动 SYN Flood 攻击 -> {target_ip}:{port}")
     print(f"发送 {count} 个数据包...")
     
-    for i in range(count):
-        # 随机源端口
-        src_port = random.randint(1024, 65535)
-        # 随机序列号
-        seq = random.randint(1000, 9000)
+    # Windows上向localhost发送的提示
+    if target_ip in ['127.0.0.1', 'localhost'] and os.name == 'nt':
+        print("\n⚠️  提示: 在Windows上向本地地址发送包可能无法被监控系统捕获")
+        print("    建议: 使用本机的真实IP地址")
+        print("    查看IP: ipconfig")
+        print("")
+        # 尝试获取本机IP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            print(f"    本机IP建议使用: {local_ip}")
+            print(f"    修改命令: python simulate_attacks.py dos --target {local_ip} --port {port} --count {count}")
+        except:
+            pass
         
-        # 构造 SYN 包
-        # 注意：为了让本地 IDS 捕获，我们通常发送到真实 IP 或 localhost
-        pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="S", seq=seq)
-        
-        send(pkt, verbose=0)
-        
-        if (i + 1) % 100 == 0:
-            sys.stdout.write(f"\r已发送: {i + 1}/{count}")
-            sys.stdout.flush()
-            
-        # 移除延时，全速发送以模拟真实DoS
-        # time.sleep(0.02) 
-        
-    print("\n[DoS] 攻击模拟完成")
+        response = input("\n是否继续? (y/N): ")
+        if response.lower() != 'y':
+            print("已取消")
+            return
+    
+    success_count = 0
+    error_count = 0
+
+    # 在 Windows 上，原始 TCP 原始包发送会因为 raw socket 限制失败
+    # 这里改为使用普通 TCP 连接快速建立/关闭，模拟 SYN flood 行为，
+    # 对入侵检测来说流量特征类似，但不依赖 raw socket/pcap。
+    if os.name == 'nt':
+        print("[DoS] Windows 环境下使用 socket.connect_ex 模拟快速连接流量")
+        for i in range(count):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.01)
+                # connect_ex 不会抛异常，返回错误码即可
+                sock.connect_ex((target_ip, port))
+                sock.close()
+                success_count += 1
+            except Exception as e:
+                error_count += 1
+                if error_count == 1:
+                    print(f"\n⚠️  发送错误: {e}")
+                    print("    尝试继续发送...")
+
+            if (i + 1) % 100 == 0:
+                sys.stdout.write(f"\r已发送: {success_count}/{count} (失败: {error_count})")
+                sys.stdout.flush()
+    else:
+        # 非 Windows 平台继续使用原来的 scapy 原始 SYN 包方式
+        for i in range(count):
+            try:
+                src_port = random.randint(1024, 65535)
+                seq = random.randint(1000, 9000)
+                pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="S", seq=seq)
+                send(pkt, verbose=0, iface=None)
+                success_count += 1
+            except Exception as e:
+                error_count += 1
+                if error_count == 1:
+                    print(f"\n⚠️  发送错误: {e}")
+                    print("    尝试继续发送...")
+
+            if (i + 1) % 100 == 0:
+                sys.stdout.write(f"\r已发送: {success_count}/{count} (失败: {error_count})")
+                sys.stdout.flush()
+
+    print(f"\n[DoS] 攻击模拟完成 - 成功: {success_count}, 失败: {error_count}")
 
 def port_scan(target_ip):
     """
@@ -54,18 +111,40 @@ def port_scan(target_ip):
     
     print(f"扫描 {len(common_ports)} 个常用端口...")
     
-    for i, port in enumerate(common_ports):
-        src_port = random.randint(1024, 65535)
-        
-        # 构造 SYN 包 (半连接扫描)
-        pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="S")
-        
-        send(pkt, verbose=0)
-        print(f"扫描端口: {port}")
-        
-        time.sleep(0.1)
-        
-    print("[Probe] 扫描模拟完成")
+    success_count = 0
+    error_count = 0
+
+    # Windows 上改用 socket.connect_ex 模拟端口探测，避免 raw socket 限制
+    if os.name == 'nt':
+        print("[Probe] Windows 环境下使用 socket.connect_ex 模拟端口扫描")
+        for i, port in enumerate(common_ports):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)
+                sock.connect_ex((target_ip, port))
+                sock.close()
+                success_count += 1
+                print(f"扫描端口: {port} - 已发起连接")
+            except Exception as e:
+                error_count += 1
+                print(f"扫描端口: {port} - 失败 ({e})")
+
+            time.sleep(0.1)
+    else:
+        for i, port in enumerate(common_ports):
+            try:
+                src_port = random.randint(1024, 65535)
+                pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="S")
+                send(pkt, verbose=0, iface=None)
+                success_count += 1
+                print(f"扫描端口: {port} - 成功")
+            except Exception as e:
+                error_count += 1
+                print(f"扫描端口: {port} - 失败 ({e})")
+
+            time.sleep(0.1)
+
+    print(f"[Probe] 扫描模拟完成 - 成功: {success_count}, 失败: {error_count}")
 
 def ping_sweep(target_ip_prefix):
     """
@@ -74,15 +153,23 @@ def ping_sweep(target_ip_prefix):
     """
     print(f"\n[Probe] 正在启动 Ping Sweep -> {target_ip_prefix}.*")
     
+    success_count = 0
+    error_count = 0
+    
     # 扫描前20个IP
     for i in range(1, 21):
-        target = f"{target_ip_prefix}.{i}"
-        pkt = IP(dst=target) / ICMP()
-        send(pkt, verbose=0)
-        print(f"Ping: {target}")
+        try:
+            target = f"{target_ip_prefix}.{i}"
+            pkt = IP(dst=target) / ICMP()
+            send(pkt, verbose=0, iface=None)
+            success_count += 1
+            print(f"Ping: {target} - 成功")
+        except Exception as e:
+            error_count += 1
+            print(f"Ping: {target} - 失败")
         time.sleep(0.1)
-        
-    print("[Probe] Ping Sweep 模拟完成")
+    
+    print(f"[Probe] Ping Sweep 模拟完成 - 成功: {success_count}, 失败: {error_count}")
 
 def r2l_attack(target_ip, port, count, interval=0.0):
     """
@@ -99,21 +186,28 @@ def r2l_attack(target_ip, port, count, interval=0.0):
         b"A" * 300,
     ]
 
+    success_count = 0
+    error_count = 0
+
     for i in range(count):
-        src_port = random.randint(1024, 65535)
-        payload = random.choice(payloads)
-        pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="PA") / payload
-        send(pkt, verbose=0)
+        try:
+            src_port = random.randint(1024, 65535)
+            payload = random.choice(payloads)
+            pkt = IP(dst=target_ip) / TCP(dport=port, sport=src_port, flags="PA") / payload
+            send(pkt, verbose=0, iface=None)
+            success_count += 1
+        except Exception as e:
+            error_count += 1
 
         if (i + 1) % 100 == 0:
-            sys.stdout.write(f"\r已发送: {i + 1}/{count}")
+            sys.stdout.write(f"\r已发送: {success_count}/{count} (失败: {error_count})")
             sys.stdout.flush()
 
         # 加入小幅抖动的间隔，避免被误判为 DoS
         if interval and interval > 0:
             jitter = random.uniform(-interval * 0.1, interval * 0.1)
             time.sleep(max(0.0, interval + jitter))
-    print("\n[R2L] 攻击模拟完成")
+    print(f"\n[R2L] 攻击模拟完成 - 成功: {success_count}, 失败: {error_count}")
 
 def u2r_attack(target_ip, port, count, interval=0.0):
     """
@@ -126,6 +220,9 @@ def u2r_attack(target_ip, port, count, interval=0.0):
     # U2R 应表现为少量但异常的大/畸形包，优先通过真实 TCP 连接发送载荷以避免被服务器拒绝
     payload_template = b"\x90" * 1200 + b"U2R_MARKER" + b"B" * 200
 
+    success_count = 0
+    error_count = 0
+
     for i in range(count):
         payload = payload_template + (b"#" + str(i).encode())
 
@@ -135,19 +232,24 @@ def u2r_attack(target_ip, port, count, interval=0.0):
             with socket.create_connection((target_ip, port), timeout=2) as sock:
                 sock.sendall(payload)
                 sent_via_socket = True
+                success_count += 1
         except Exception:
             # 连接失败（端口关闭或被防火墙拒绝），回退到原始数据包发送
             sent_via_socket = False
 
         if not sent_via_socket:
-            src_port = random.randint(40000, 60000)
-            # 回退时使用常规 PSH+ACK 标志，避免使用异常标志导致 REJ
-            tcp_seg = TCP(dport=port, sport=src_port, flags="PA", window=65535)
-            pkt = IP(dst=target_ip, ttl=64) / tcp_seg / payload
-            send(pkt, verbose=0)
+            try:
+                src_port = random.randint(40000, 60000)
+                # 回退时使用常规 PSH+ACK 标志，避免使用异常标志导致 REJ
+                tcp_seg = TCP(dport=port, sport=src_port, flags="PA", window=65535)
+                pkt = IP(dst=target_ip, ttl=64) / tcp_seg / payload
+                send(pkt, verbose=0, iface=None)
+                success_count += 1
+            except Exception as e:
+                error_count += 1
 
         if (i + 1) % 50 == 0:
-            sys.stdout.write(f"\r已发送: {i + 1}/{count}")
+            sys.stdout.write(f"\r已发送: {success_count}/{count} (失败: {error_count})")
             sys.stdout.flush()
 
         # 加入较大间隔与小幅抖动，U2R 是低频触发型攻击
@@ -155,7 +257,7 @@ def u2r_attack(target_ip, port, count, interval=0.0):
             jitter = random.uniform(-interval * 0.1, interval * 0.1)
             time.sleep(max(0.0, interval + jitter))
 
-    print("\n[U2R] 攻击模拟完成")
+    print(f"\n[U2R] 攻击模拟完成 - 成功: {success_count}, 失败: {error_count}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="网络攻击流量模拟器")

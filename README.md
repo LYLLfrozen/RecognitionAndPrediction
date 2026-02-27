@@ -221,18 +221,47 @@ ls -l /dev/bpf*
 
 说明：加入 `access_bpf` 后，你无需再以 `sudo` 运行程序或每次 `chmod /dev/bpf*`，系统会在启动时维护设备权限，推荐用于长期开发与使用。
 
-**启动项目**
-python3 run_realtime_detection.py --interface lo0
+## 🛡️ 实时入侵检测系统
 
-**模拟dos攻击**
-python3 simulate_attacks.py dos --target 127.0.0.1 --port 80 --count 5000
+### 快速开始
+```bash
+# 1. 获取本机IP地址（Windows上不要使用127.0.0.1）
+cd VFL
+python get_local_ip.py
 
-**模拟r2l攻击**
-python3 simulate_attacks.py r2l --target 127.0.0.1 --port 21 --count 5 --interval 1.0
+# 2. 启动实时监控（需要管理员权限）
+python realtime_monitor.py --interface "以太网"
 
-**模拟u2r攻击**
-python3 simulate_attacks.py u2r --target 127.0.0.1 --port 80 --count 100 --interval 2.0
-由于u2r的训练数据较少，大概率识别不出来。
+# 3. 在另一个终端模拟攻击（测试检测效果）
+# Windows需要以管理员身份运行PowerShell
+# 使用步骤1获取的真实IP地址（例如192.168.1.100）
+
+# 模拟DoS攻击（SYN Flood）
+python simulate_attacks.py dos --target 192.168.1.100 --port 80 --count 1000
+
+# 模拟端口扫描（Probe）
+python simulate_attacks.py probe --target 192.168.1.100
+
+# 模拟R2L攻击（暴力破解）
+python simulate_attacks.py r2l --target 192.168.1.100 --port 21 --count 10 --interval 1.0
+
+# 模拟U2R攻击（提权尝试）
+python simulate_attacks.py u2r --target 192.168.1.100 --port 80 --count 50 --interval 2.0
+```
+
+### 重要说明
+1. **Windows用户**：发送原始网络包需要以**管理员身份运行PowerShell**
+2. **目标IP选择**：在Windows上**不要使用127.0.0.1**，使用 `python get_local_ip.py` 获取本机真实IP
+3. **网卡选择**：使用 `ipconfig` 查看可用网卡，选择实际使用的网卡（如"以太网"、"WLAN"等）
+4. **正常流量识别**：系统已优化，正常浏览网页等行为会被正确识别为 `normal`
+5. **攻击检测**：只有满足严格条件的流量才会被识别为攻击（避免误报）
+6. **U2R攻击**：由于训练数据较少，可能识别准确率较低
+
+### 检测阈值说明
+- **DoS检测**：需要40+个快速连接 + 85%以上错误率
+- **Probe检测**：需要100+个连接 + 访问15+个不同端口 + 90%服务多样性 + 70%以上错误率
+- **R2L检测**：针对SSH/FTP/Telnet等登录服务的多次尝试
+- **正常流量**：访问常见端口（80/443等）+ 连接数<80 + 低错误率
 
 
 

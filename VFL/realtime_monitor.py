@@ -425,28 +425,154 @@ class RealTimeFlowMonitor:
                     print(f"  ⚠️  处理包时出错: {e}")
         
         try:
-            # 开始捕获
-            interface = self.interface if self.interface else CAPTURE_INTERFACE
+            # 修正 Windows 下常见接口别名
+            if os.name == 'nt':
+                if interface == 'lo0' or interface == 'lo':
+                    print("  正在查找 Windows Loopback 适配器...")
+                    try:
+                        from scapy.arch.windows import get_windows_if_list
+                        win_if_list = get_windows_if_list()
+                        for iface in win_if_list:
+                            if 'loopback' in iface['name'].lower() or \
+                               'loopback' in iface['description'].lower():
+                                interface = iface['name']
+                                print(f"  >>> 自动映射 lo0 -> {interface}")
+                                break
+                    except:
+                        pass
             print(f"\n🔍 正在监听接口 {interface or '所有接口'}...")
             print("   等待网络流量中...")
 
             # 显示更多诊断信息
             try:
-                from scapy.all import get_if_list  # type: ignore
-                if_list = get_if_list()
-                print(f"  可用网络接口: {', '.join(if_list)}")
-            except Exception:
-                pass
+                from scapy.all import get_if_list, conf
+                if os.name == 'nt':
+                    print("  正在获取Windows网络接口列表...")
+                    # 在Windows上尝试显示更友好的名称
+                    try:
+                        from scapy.arch.windows import get_windows_if_list
+                        win_if_list = get_windows_if_list()
+                        print("\n  可用网络接口:")
+                        target_interface = interface
+                        for i, iface in enumerate(win_if_list):
+                            desc = f"{iface['name']} - {iface['description']}"
+                            print(f"  [{i}] {desc}")
+                            # 尝试匹配用户输入的接口名（如果只给了部分名称），仅作提示，不修改interface变量以免影响后续逻辑
+                            if target_interface and (target_interface.lower() in iface['name'].lower() or 
+                                            target_interface.lower() in iface['description'].lower()):
+                                print(f"  >>> (提示) 匹配到接口: {iface['name']}")
+
+                    except ImportError:
+                        if_list = get_if_list()
+                        print(f"  可用网络接口(GUID): {', '.join(if_list)}")
+                else:
+                    if_list = get_if_list()
+                    print(f"  可用网络接口: {', '.join(if_list)}")
+            except Exception as e:
+                print(f"  获取接口列表失败: {e}")
+
+            # 在Windows上尝试更智能的接口匹配
+            if os.name == 'nt' and interface:
+                try:
+                    from scapy.arch.windows import get_windows_if_list
+                    win_if_list = get_windows_if_list()
+                    matched = False
+                    
+                    # 1. 优先匹配非虚拟接口
+                    # 先按照精确名称查找
+                    candidates = []
+                    for iface in win_if_list:
+                        if interface.lower() == iface['name'].lower():
+                            candidates = [iface]
+                            break
+                    
+                    # 模糊匹配
+                    if not candidates:
+                        temp_candidates = []
+                        for iface in win_if_list:
+                            # 排除明显的虚拟接口/过滤器/Loopback，除非用户明确指定
+                            desc_lower = iface['description'].lower()
+                            is_virtual = 'loopback' in desc_lower or \
+                                         'tap-' in desc_lower or \
+                                         'virtual' in desc_lower or \
+                                         'wfp' in desc_lower or \
+                                         'packet driver' in desc_lower
+                            
+                            # 名字、描述或GUID匹配
+                            match = (interface.lower() in iface['name'].lower() or \
+                                     interface.lower() in iface['description'].lower() or \
+                                     interface.lower() in iface['guid'].lower())
+                            
+                            if match:
+                                temp_candidates.append((iface, is_virtual))
+                        
+                        # 选择最佳匹配
+                        if temp_candidates:
+                            # 优先选择非虚拟接口
+                            real_ifaces = [c[0] for c in temp_candidates if not c[1]]
+                            if real_ifaces:
+                                best_iface = real_ifaces[0]
+                            else:
+                                # 只有虚拟接口匹配
+                                best_iface = temp_candidates[0][0]
+                            candidates = [best_iface]
+
+                    if candidates:
+                        best_iface = candidates[0]
+                        print(f"\n  >>> 自动匹配到Windows接口: {best_iface['name']} ({best_iface['description']})")
+                        interface = best_iface['name']
+                        matched = True
+                    
+                    if not matched:
+                        print(f"\n  ⚠️ 未找到包含 '{interface}' 的接口，将尝试默认接口")
+                        # 列出可用接口供用户参考
+                        print("  可用接口列表:")
+                        for i, iface in enumerate(win_if_list):
+                            print(f"    {i}. {iface['name']} ({iface['description']})")
+                except ImportError:
+                    pass
 
             # 循环调用 sniff，设置短超时以便检查是否长时间无包
             sniff_timeout = 5
             max_no_packet = 10
             while self.running:
-                sniff(iface=interface,
-                      prn=packet_handler,
-                      filter="ip",
-                      store=False,
-                      timeout=sniff_timeout)
+                # 在Windows上如果没有WinPcap/Npcap，可能无法进行L2捕获
+                # 尝试使用L3捕获
+                try:
+                    sniff(iface=interface,
+                          prn=packet_handler,
+                          filter=None,  # 移除过滤器，捕获所有包
+                          store=False,
+                          timeout=sniff_timeout)
+                except (OSError, RuntimeError) as e:
+                    # Catch both OSError (file not found/permission) and RuntimeError (scapy layer 2 unavailable)
+                    err_msg = str(e).lower()
+                    if "winpcap" in err_msg or "layer 2" in err_msg or "pcap" in err_msg:
+                        print("\n⚠️  WinPcap未安装或L2不可用，尝试使用L3 Socket...")
+                        from scapy.all import conf
+                        conf.L3socket = conf.L3socket
+                        
+                        # L3捕获通常不需要指定复杂接口名，尝试留空让其自动选择或使用简单名称
+                        # 或者尝试传入 None (监听所有)
+                        l3_interface = interface
+                        if os.name == 'nt' and interface and "filter" in interface.lower():
+                             # Windows下WFP过滤器接口通常不支持L3 Socket绑定
+                             print(f"  提示: 接口 '{interface}' 可能是WFP过滤器，L3模式下将尝试自动选择最佳接口")
+                             l3_interface = None
+                             
+                        try:
+                            sniff(iface=l3_interface,
+                                  prn=packet_handler,
+                                  filter=None, # 移除过滤器
+                                  store=False,
+                                  timeout=sniff_timeout,
+                                  L2socket=conf.L3socket)
+                        except Exception as l3_err:
+                            print(f"\n❌ L3捕获也失败: {l3_err}")
+                            print("  提示: 请尝试以管理员身份运行，或安装 Npcap (https://npcap.com/)")
+                            raise l3_err
+                    else:
+                        raise e
 
                 # 检查是否有包到达
                 if self.captured_packets == last_captured:
@@ -761,17 +887,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 测试集模式（验证准确率）
-  python3 realtime_monitor.py
+  # 默认模式（监测本地真实流量）
+  sudo python3 realtime_monitor.py
   
-  # 真实流量模式（所有接口）
-  sudo python3 realtime_monitor.py --real
+  # 模拟模式（使用测试集验证准确率）
+  python3 realtime_monitor.py --sim
   
   # 检测本地回环接口（lo0）
-  sudo python3 realtime_monitor.py --real --interface lo0
+  sudo python3 realtime_monitor.py --interface lo0
   
   # 检测指定WiFi接口
-  sudo python3 realtime_monitor.py --real --interface en0
+  sudo python3 realtime_monitor.py --interface en0
   
   # 查看可用网络接口
   ifconfig  # macOS/Linux
@@ -780,9 +906,9 @@ def main():
     )
     
     parser.add_argument(
-        '-r', '--real',
+        '-s', '--sim',
         action='store_true',
-        help='使用真实网络流量（需要sudo权限）'
+        help='使用模拟数据（测试集）'
     )
     
     parser.add_argument(
@@ -801,7 +927,8 @@ def main():
     
     args = parser.parse_args()
     
-    print("\n正在加载VFL模型...")
+    # 默认使用真实流量，除非指定了 --sim
+    use_real = not args.sim
     
     # 检查模型文件
     if not os.path.exists(MODEL_DIR):
@@ -830,21 +957,20 @@ def main():
         return
     
     # 检查权限和依赖
-    if args.real and not SCAPY_AVAILABLE:
+    if use_real and not SCAPY_AVAILABLE:
         print("\n❌ 错误: scapy未安装，无法捕获真实流量")
         print("   安装: pip install scapy")
-        print("   或使用测试集模式: python3 realtime_monitor.py\n")
+        print("   或使用测试集模式: python3 realtime_monitor.py --sim\n")
         return
     
-    if args.interface and not args.real:
-        print("\n⚠️  警告: --interface 参数需要配合 --real 使用")
-        print("   自动启用真实流量模式\n")
-        args.real = True
+    if args.interface and not use_real:
+        print("\n⚠️  警告: --interface 参数需要配合真实流量模式使用")
+        print("   忽略 --interface 参数\n")
     
     # 创建并启动监控器
     monitor = RealTimeFlowMonitor(
         classifier, 
-        use_real_traffic=args.real,
+        use_real_traffic=use_real,
         interface=args.interface
     )
     

@@ -105,7 +105,21 @@ def train_vfl(parties, server, epochs, batch_size, X_test_parties, y_test, devic
     print(f"  参与方数: {len(parties)}")
     
     active_party = parties[0]  # 第一个参与方是主动方
-    criterion = nn.CrossEntropyLoss()
+    
+    # 计算类别权重以处理不平衡数据
+    # DoS类样本非常多，可能导致模型倾向于预测DoS
+    # 计算权重: weight = n_samples / (n_classes * n_samples_per_class)
+    y_train_np = active_party.y_train.cpu().numpy()
+    unique_labels, counts = np.unique(y_train_np, return_counts=True)
+    n_samples = len(y_train_np)
+    n_classes = len(unique_labels)
+    class_weights = n_samples / (n_classes * counts)
+    
+    # 转为Tensor并移动到设备
+    weights_tensor = torch.FloatTensor(class_weights).to(device)
+    print(f"\n类别权重: {weights_tensor}")
+    
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
     
     # 为顶层模型创建优化器
     top_optimizer = optim.Adam(server.top_model.parameters(), lr=0.001)

@@ -131,13 +131,22 @@ class FlowTracker:
                           if c['dst_port'] == dst_port]
         features['same_srv_count'] = len(recent_same_srv)
         
-        # 错误率统计 (使用SYN/RST作为代理)
+        # 错误率统计 (基于RST和未完成的连接)
+        # serror_rate: SYN错误率，即发送SYN但被RST的比率
+        # rerror_rate: REJ错误率，即连接被拒绝的比率
         if recent_same_dst:
-            syn_count = sum(1 for c in recent_same_dst 
-                           if c['features'].get('syn_count', 0) > 0)
+            # 统计只有SYN的连接（可能的半连接/失败连接）
+            syn_only = sum(1 for c in recent_same_dst 
+                          if c['features'].get('syn_count', 0) > 0 and 
+                             c['features'].get('psh_count', 0) == 0 and
+                             c['features'].get('fin_count', 0) == 0)
+            # 统计有RST的连接（连接被重置）
             rst_count = sum(1 for c in recent_same_dst 
                            if c['features'].get('rst_count', 0) > 0)
-            features['serror_rate'] = syn_count / len(recent_same_dst)
+            
+            # 错误率：异常连接占比
+            # 正常连接应该有PSH或FIN，只有SYN的很可能是扫描或失败连接
+            features['serror_rate'] = syn_only / len(recent_same_dst)
             features['rerror_rate'] = rst_count / len(recent_same_dst)
         else:
             features['serror_rate'] = 0
