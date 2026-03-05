@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时网络流量监测和识别系统
+实时网络流量监测和识别系统（GUI版本）
 使用训练好的VFL模型实时识别网络流量类型
 """
 
@@ -16,6 +16,24 @@ import threading
 import queue
 from collections import deque, Counter
 from typing import TYPE_CHECKING
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# 设置中文字体支持
+import platform
+if platform.system() == 'Darwin':  # macOS
+    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'STHeiti', 'SimHei']
+elif platform.system() == 'Windows':
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'KaiTi']
+else:  # Linux
+    plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Droid Sans Fallback', 'SimHei']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 # 条件导入 scapy
 try:
@@ -677,16 +695,16 @@ class RealTimeFlowMonitor:
                 continue
     
     def display_stats(self):
-        """显示实时统计"""
+        """显示实时统计（终端模式，GUI模式不使用）"""
         while self.running:
             time.sleep(UPDATE_INTERVAL)
-            
+
             # 清空屏幕（仅在终端中有效）
             os.system('clear' if os.name == 'posix' else 'cls')
-            
+
             # 计算运行时间
             elapsed = time.time() - self.start_time
-            
+
             # 计算准确率（仅在模拟模式下）
             if self.recent_predictions:
                 has_labels = any(p['correct'] is not None for p in self.recent_predictions)
@@ -695,7 +713,7 @@ class RealTimeFlowMonitor:
                     recent_accuracy = recent_correct / len(self.recent_predictions) * 100
                 else:
                     recent_accuracy = None  # 真实流量无法计算准确率
-                
+
                 # 计算每个类别的数量
                 recent_pred_dist = Counter(p['predicted'] for p in self.recent_predictions)
                 recent_true_dist = Counter(p['true'] for p in self.recent_predictions)
@@ -703,20 +721,20 @@ class RealTimeFlowMonitor:
                 recent_accuracy = None
                 recent_pred_dist = Counter()
                 recent_true_dist = Counter()
-            
+
             # 显示标题
             print("=" * 80)
             print(f"{'实时网络流量监控':^80}")
             print("=" * 80)
             print(f"设备: {device} | 运行时间: {elapsed:.1f}秒 | 更新间隔: {UPDATE_INTERVAL}秒")
             print("-" * 80)
-            
+
             # 显示总体统计
             print(f"\n【总体统计】")
             print(f"  总流量包: {self.total_flows}")
             print(f"  处理速度: {self.total_flows / elapsed:.2f} 包/秒")
             print(f"  队列长度: {self.flow_queue.qsize()}")
-            
+
             # 显示最近窗口准确率
             print(f"\n【最近 {len(self.recent_predictions)} 个样本】")
             if recent_accuracy is not None:
@@ -731,7 +749,7 @@ class RealTimeFlowMonitor:
                     low_conf = sum(1 for c in confs if c < 0.8)
                     if low_conf > 0:
                         print(f"  ⚠️  低置信度样本(<0.8): {low_conf} ({low_conf/len(confs)*100:.1f}%)")
-            
+
             # 显示类别分布
             print(f"\n【流量识别统计】")
             if not self.class_counts:
@@ -741,7 +759,7 @@ class RealTimeFlowMonitor:
                     count = self.class_counts[cls]
                     pct = count / self.total_flows * 100 if self.total_flows > 0 else 0
                     bar = '█' * int(pct / 2)
-                    
+
                     # 添加类别说明
                     cls_desc = {
                         'normal': '正常流量',
@@ -750,20 +768,20 @@ class RealTimeFlowMonitor:
                         'r2l': '远程登录攻击',
                         'u2r': '提权攻击'
                     }.get(cls, '')
-                    
+
                     print(f"  {cls:8s} ({cls_desc:10s}): {count:5d} ({pct:5.1f}%) {bar}")
-            
+
             # 显示最近5个预测
             print(f"\n【最近识别】")
             if not any(p['correct'] is not None for p in self.recent_predictions):
                 # 真实流量模式：突出显示识别结果
                 print(f"  {'时间':8s} {'识别类型':10s} {'置信度':8s} {'说明':20s}")
                 print("  " + "-" * 55)
-                
+
                 for p in list(self.recent_predictions)[-5:]:
                     ts = datetime.fromtimestamp(p['timestamp']).strftime('%H:%M:%S')
                     conf_str = f"{p['confidence']:.3f}"
-                    
+
                     # 根据置信度添加说明
                     if p['confidence'] >= 0.9:
                         desc = "高度确信"
@@ -771,9 +789,9 @@ class RealTimeFlowMonitor:
                         desc = "较为确定"
                     else:
                         desc = "不太确定"
-                    
+
                     print(f"  {ts:8s} {p['predicted']:10s} {conf_str:8s} {desc:20s}")
-                
+
                 print("\n💡 说明:")
                 print("   '识别类型' = 模型识别出的流量类型（这就是识别结果！）")
                 print("   真实流量没有预先标注，无法显示参考答案")
@@ -782,15 +800,46 @@ class RealTimeFlowMonitor:
                 # 测试集模式：显示完整对比
                 print(f"  {'时间':8s} {'预测':8s} {'真实':8s} {'置信度':8s} {'结果':4s}")
                 print("  " + "-" * 50)
-                
+
                 for p in list(self.recent_predictions)[-5:]:
                     ts = datetime.fromtimestamp(p['timestamp']).strftime('%H:%M:%S')
                     result = '✓' if p['correct'] else '✗' if p['correct'] is not None else '-'
                     print(f"  {ts:8s} {p['predicted']:8s} {p['true']:8s} "
                           f"{p['confidence']:.3f}    {result}")
-            
+
             print("\n" + "=" * 80)
             print("按 Ctrl+C 退出监控")
+
+    def get_stats(self):
+        """获取当前统计数据（供GUI使用）"""
+        elapsed = time.time() - self.start_time
+
+        stats = {
+            'total_flows': self.total_flows,
+            'elapsed_time': elapsed,
+            'speed': self.total_flows / elapsed if elapsed > 0 else 0,
+            'queue_size': self.flow_queue.qsize(),
+            'class_counts': dict(self.class_counts),
+            'recent_predictions': list(self.recent_predictions)
+        }
+
+        # 计算准确率
+        if self.recent_predictions:
+            has_labels = any(p['correct'] is not None for p in self.recent_predictions)
+            if has_labels:
+                recent_correct = sum(1 for p in self.recent_predictions if p['correct'])
+                stats['accuracy'] = recent_correct / len(self.recent_predictions) * 100
+            else:
+                stats['accuracy'] = None
+                # 计算置信度统计
+                confs = [p['confidence'] for p in self.recent_predictions]
+                stats['avg_confidence'] = np.mean(confs)
+                stats['min_confidence'] = min(confs)
+                stats['max_confidence'] = max(confs)
+        else:
+            stats['accuracy'] = None
+
+        return stats
     
     def start(self, duration=None):
         """
@@ -877,56 +926,403 @@ class RealTimeFlowMonitor:
                     print(f"  成功检测到 {self.total_flows} 个流量包")
 
 
+class MonitorGUI:
+    """网络流量监控GUI"""
+
+    def __init__(self, classifier, use_real_traffic=True, interface=None):
+        self.classifier = classifier
+        self.use_real_traffic = use_real_traffic
+        self.interface = interface
+        self.monitor = None
+
+        # 创建主窗口
+        self.root = tk.Tk()
+        self.root.title("VFL 实时网络流量监控系统")
+        self.root.geometry("1200x800")
+
+        # 设置样式
+        self.setup_styles()
+
+        # 创建UI组件
+        self.create_widgets()
+
+        # 数据存储
+        self.traffic_history = deque(maxlen=100)  # 存储流量速率历史
+        self.class_history = {cls: deque(maxlen=100) for cls in classifier.class_names}
+
+        # 更新标志
+        self.is_monitoring = False
+
+    def setup_styles(self):
+        """设置样式"""
+        style = ttk.Style()
+        style.theme_use('clam')
+
+    def create_widgets(self):
+        """创建UI组件"""
+        # 顶部控制面板
+        control_frame = ttk.Frame(self.root, padding="10")
+        control_frame.pack(fill=tk.X)
+
+        # 标题
+        title_label = ttk.Label(control_frame, text="VFL 实时网络流量监控系统",
+                                font=('Arial', 16, 'bold'))
+        title_label.pack(side=tk.LEFT, padx=10)
+
+        # 控制按钮
+        self.start_btn = ttk.Button(control_frame, text="开始监测",
+                                     command=self.start_monitoring, width=15)
+        self.start_btn.pack(side=tk.RIGHT, padx=5)
+
+        self.stop_btn = ttk.Button(control_frame, text="停止监测",
+                                    command=self.stop_monitoring, width=15, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.RIGHT, padx=5)
+
+        # 模式选择
+        mode_frame = ttk.Frame(control_frame)
+        mode_frame.pack(side=tk.RIGHT, padx=20)
+        ttk.Label(mode_frame, text="模式:").pack(side=tk.LEFT, padx=5)
+        self.mode_var = tk.StringVar(value="real" if self.use_real_traffic else "sim")
+        ttk.Radiobutton(mode_frame, text="真实流量", variable=self.mode_var,
+                       value="real").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="模拟数据", variable=self.mode_var,
+                       value="sim").pack(side=tk.LEFT)
+
+        # 中间内容区域
+        content_frame = ttk.Frame(self.root)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 左侧：统计信息
+        left_frame = ttk.LabelFrame(content_frame, text="实时统计", padding="10")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        # 统计标签
+        stats_frame = ttk.Frame(left_frame)
+        stats_frame.pack(fill=tk.X, pady=5)
+
+        self.stats_labels = {}
+        stats_items = [
+            ('status', '状态:', '未启动'),
+            ('total', '总流量包:', '0'),
+            ('speed', '处理速度:', '0.0 包/秒'),
+            ('elapsed', '运行时间:', '0 秒'),
+            ('accuracy', '准确率:', 'N/A')
+        ]
+
+        for key, label, default in stats_items:
+            row = ttk.Frame(stats_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, font=('Arial', 10, 'bold'), width=12).pack(side=tk.LEFT)
+            value_label = ttk.Label(row, text=default, font=('Arial', 10))
+            value_label.pack(side=tk.LEFT)
+            self.stats_labels[key] = value_label
+
+        # 流量分类统计
+        class_frame = ttk.LabelFrame(left_frame, text="流量分类统计", padding="10")
+        class_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.class_labels = {}
+        class_desc = {
+            'normal': '正常流量',
+            'dos': 'DoS攻击',
+            'probe': '探测扫描',
+            'r2l': '远程登录攻击',
+            'u2r': '提权攻击'
+        }
+
+        for cls in self.classifier.class_names:
+            row = ttk.Frame(class_frame)
+            row.pack(fill=tk.X, pady=3)
+            desc = class_desc.get(cls, '')
+            ttk.Label(row, text=f"{cls} ({desc}):", width=25).pack(side=tk.LEFT)
+
+            # 进度条
+            progress = ttk.Progressbar(row, mode='determinate', length=200)
+            progress.pack(side=tk.LEFT, padx=5)
+
+            # 数量标签
+            count_label = ttk.Label(row, text="0 (0.0%)", width=15)
+            count_label.pack(side=tk.LEFT)
+
+            self.class_labels[cls] = {'progress': progress, 'label': count_label}
+
+        # 最近检测记录
+        recent_frame = ttk.LabelFrame(left_frame, text="最近检测记录", padding="10")
+        recent_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 创建表格
+        columns = ('时间', '预测类型', '置信度', '方法')
+        self.tree = ttk.Treeview(recent_frame, columns=columns, show='headings', height=8)
+
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=100)
+
+        scrollbar = ttk.Scrollbar(recent_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 右侧：可视化图表
+        right_frame = ttk.LabelFrame(content_frame, text="流量可视化", padding="10")
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        # 创建matplotlib图表
+        self.fig = Figure(figsize=(6, 8), dpi=100)
+
+        # 流量速率图
+        self.ax1 = self.fig.add_subplot(211)
+        self.ax1.set_title('流量处理速率')
+        self.ax1.set_xlabel('时间 (秒)')
+        self.ax1.set_ylabel('包/秒')
+        self.ax1.grid(True, alpha=0.3)
+        self.line1, = self.ax1.plot([], [], 'b-', linewidth=2)
+
+        # 流量分类饼图
+        self.ax2 = self.fig.add_subplot(212)
+        self.ax2.set_title('流量分类分布')
+
+        self.fig.tight_layout()
+
+        # 嵌入到tkinter
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # 底部日志区域
+        log_frame = ttk.LabelFrame(self.root, text="系统日志", padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=6,
+                                                   font=('Courier', 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def log(self, message):
+        """添加日志"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+
+    def start_monitoring(self):
+        """开始监测"""
+        if self.is_monitoring:
+            return
+
+        self.is_monitoring = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+
+        # 更新模式
+        use_real = (self.mode_var.get() == "real")
+
+        # 创建监控器
+        self.monitor = RealTimeFlowMonitor(
+            self.classifier,
+            use_real_traffic=use_real and SCAPY_AVAILABLE,
+            interface=self.interface
+        )
+
+        self.log(f"开始监测 - 模式: {'真实流量' if use_real else '模拟数据'}")
+        self.stats_labels['status'].config(text='监测中', foreground='green')
+
+        # 启动监控线程
+        if use_real and SCAPY_AVAILABLE:
+            capture_thread = threading.Thread(target=self.monitor.real_flow_capture, daemon=True)
+        else:
+            capture_thread = threading.Thread(target=self.monitor.simulate_flow_capture, daemon=True)
+
+        process_thread = threading.Thread(target=self.monitor.process_flows, daemon=True)
+
+        self.monitor.running = True
+        capture_thread.start()
+        process_thread.start()
+
+        # 启动GUI更新
+        self.update_gui()
+
+    def stop_monitoring(self):
+        """停止监测"""
+        if not self.is_monitoring:
+            return
+
+        self.is_monitoring = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+
+        if self.monitor:
+            self.monitor.running = False
+
+        self.log("监测已停止")
+        self.stats_labels['status'].config(text='已停止', foreground='red')
+
+    def update_gui(self):
+        """更新GUI显示"""
+        if not self.is_monitoring or not self.monitor:
+            return
+
+        try:
+            stats = self.monitor.get_stats()
+
+            # 更新统计信息
+            self.stats_labels['total'].config(text=str(stats['total_flows']))
+            self.stats_labels['speed'].config(text=f"{stats['speed']:.2f} 包/秒")
+            self.stats_labels['elapsed'].config(text=f"{stats['elapsed_time']:.1f} 秒")
+
+            if stats['accuracy'] is not None:
+                self.stats_labels['accuracy'].config(text=f"{stats['accuracy']:.2f}%")
+            else:
+                if 'avg_confidence' in stats:
+                    self.stats_labels['accuracy'].config(
+                        text=f"置信度: {stats['avg_confidence']:.3f}"
+                    )
+                else:
+                    self.stats_labels['accuracy'].config(text="N/A")
+
+            # 更新类别统计
+            total = stats['total_flows']
+            for cls, data in self.class_labels.items():
+                count = stats['class_counts'].get(cls, 0)
+                pct = (count / total * 100) if total > 0 else 0
+                data['progress']['value'] = pct
+                data['label'].config(text=f"{count} ({pct:.1f}%)")
+
+            # 更新最近记录
+            recent = stats['recent_predictions'][-10:]  # 最近10条
+
+            # 清空树
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            # 添加新记录
+            for p in reversed(recent):
+                ts = datetime.fromtimestamp(p['timestamp']).strftime('%H:%M:%S')
+                method = p.get('method', 'ml')
+                values = (ts, p['predicted'], f"{p['confidence']:.3f}", method)
+                self.tree.insert('', 0, values=values)
+
+            # 更新图表
+            self.update_charts(stats)
+
+        except Exception as e:
+            self.log(f"更新错误: {e}")
+
+        # 继续更新
+        if self.is_monitoring:
+            self.root.after(1000, self.update_gui)  # 每秒更新
+
+    def update_charts(self, stats):
+        """更新图表"""
+        # 更新流量速率
+        self.traffic_history.append(stats['speed'])
+
+        x_data = list(range(len(self.traffic_history)))
+        y_data = list(self.traffic_history)
+
+        self.line1.set_data(x_data, y_data)
+        self.ax1.relim()
+        self.ax1.autoscale_view()
+
+        # 更新饼图
+        self.ax2.clear()
+        self.ax2.set_title('流量分类分布')
+
+        class_counts = stats['class_counts']
+        if class_counts and sum(class_counts.values()) > 0:
+            labels = []
+            sizes = []
+            colors = ['#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#3498db']
+
+            for cls in sorted(class_counts.keys()):
+                if class_counts[cls] > 0:
+                    labels.append(cls)
+                    sizes.append(class_counts[cls])
+
+            if sizes:
+                self.ax2.pie(sizes, labels=labels, autopct='%1.1f%%',
+                            colors=colors[:len(sizes)], startangle=90)
+                self.ax2.axis('equal')
+
+        self.canvas.draw()
+
+    def run(self):
+        """运行GUI"""
+        self.log("VFL 网络流量监控系统已启动")
+        self.log(f"设备: {device}")
+        self.log(f"模型: {len(self.classifier.class_names)} 个类别")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+
+    def on_closing(self):
+        """关闭窗口"""
+        if self.is_monitoring:
+            if messagebox.askokcancel("退出", "监测正在进行，确定要退出吗？"):
+                self.stop_monitoring()
+                self.root.destroy()
+        else:
+            self.root.destroy()
+
+
 def main():
     """主函数"""
     import argparse
-    
+
     # 解析命令行参数
     parser = argparse.ArgumentParser(
         description='VFL实时网络流量监控系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 默认模式（监测本地真实流量）
+  # GUI模式（默认）
+  python3 realtime_monitor.py --gui
+
+  # 终端模式 - 监测本地真实流量
   sudo python3 realtime_monitor.py
-  
-  # 模拟模式（使用测试集验证准确率）
+
+  # 终端模式 - 模拟模式（使用测试集验证准确率）
   python3 realtime_monitor.py --sim
-  
+
   # 检测本地回环接口（lo0）
   sudo python3 realtime_monitor.py --interface lo0
-  
+
   # 检测指定WiFi接口
   sudo python3 realtime_monitor.py --interface en0
-  
+
   # 查看可用网络接口
   ifconfig  # macOS/Linux
   ipconfig  # Windows
         """
     )
-    
+
+    parser.add_argument(
+        '-g', '--gui',
+        action='store_true',
+        help='使用GUI模式'
+    )
+
     parser.add_argument(
         '-s', '--sim',
         action='store_true',
         help='使用模拟数据（测试集）'
     )
-    
+
     parser.add_argument(
         '-i', '--interface',
         type=str,
         default=None,
         help='指定网络接口（如: lo0, en0, eth0等），默认捕获所有接口'
     )
-    
+
     parser.add_argument(
         '-d', '--duration',
         type=int,
         default=None,
-        help='运行时长（秒），默认无限运行'
+        help='运行时长（秒），默认无限运行（仅终端模式）'
     )
-    
+
     args = parser.parse_args()
-    
+
     # 默认使用真实流量，除非指定了 --sim
     use_real = not args.sim
     
@@ -957,25 +1353,32 @@ def main():
         return
     
     # 检查权限和依赖
-    if use_real and not SCAPY_AVAILABLE:
+    if use_real and not SCAPY_AVAILABLE and not args.gui:
         print("\n❌ 错误: scapy未安装，无法捕获真实流量")
         print("   安装: pip install scapy")
         print("   或使用测试集模式: python3 realtime_monitor.py --sim\n")
         return
-    
+
     if args.interface and not use_real:
         print("\n⚠️  警告: --interface 参数需要配合真实流量模式使用")
         print("   忽略 --interface 参数\n")
-    
-    # 创建并启动监控器
-    monitor = RealTimeFlowMonitor(
-        classifier, 
-        use_real_traffic=use_real,
-        interface=args.interface
-    )
-    
-    # 运行监控
-    monitor.start(duration=args.duration)
+
+    # GUI模式
+    if args.gui:
+        gui = MonitorGUI(
+            classifier,
+            use_real_traffic=use_real,
+            interface=args.interface
+        )
+        gui.run()
+    # 终端模式
+    else:
+        monitor = RealTimeFlowMonitor(
+            classifier,
+            use_real_traffic=use_real,
+            interface=args.interface
+        )
+        monitor.start(duration=args.duration)
 
 
 if __name__ == '__main__':
