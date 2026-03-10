@@ -14,11 +14,13 @@ class HybridAttackDetector:
         self.ml_classifier = ml_classifier
         self.flow_tracker = flow_tracker
         
-        # 检测阈值（调整后避免误判）
+        # 检测阈值（调整后提高DoS检测灵敏度）
         self.dos_threshold = {
-            'same_dst_count': 40,   # 进一步提高，避免误判浏览器并发连接
-            'serror_rate': 0.85,    # 提高SYN错误率阈值
-            'syn_rate': 0.9         # SYN包占比
+            'same_dst_count': 20,   # 降低阈值以便更早检测到SYN flood
+            'serror_rate': 0.5,     # 降低SYN错误率阈值
+            'syn_rate': 0.7,        # SYN包占比
+            'min_syn_count': 10,    # 最少SYN包数量
+            'small_packet_size': 100  # SYN包通常很小
         }
         
         self.probe_threshold = {
@@ -88,7 +90,7 @@ class HybridAttackDetector:
         return ml_pred, ml_conf, 'ml'
     
     def _rule_based_verification(self, base_features, packet_info, flow_stats, ml_pred, ml_conf):
-        """基于规则的验证（仅在非常明显的攻击特征时覆盖ML结果）"""
+        """基于规则的验证（改进的DoS检测）"""
 
         # 提取关键特征
         protocol = packet_info.get('protocol', 0)
@@ -99,16 +101,34 @@ class HybridAttackDetector:
         same_dst = flow_stats.get('same_dst_count', 0)
         serror_rate = flow_stats.get('serror_rate', 0)
         diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
+        syn_count = flow_stats.get('syn_count', 0)
+        psh_count = flow_stats.get('psh_count', 0)
+        fin_count = flow_stats.get('fin_count', 0)
 
-        # 【强规则1: 明显的DoS攻击 (SYN Flood)】
-        # 只在特征非常明显时才覆盖ML结果
-        if protocol == 6 and tcp_flags & 0x02:  # TCP SYN
-            # 极强条件：非常大量的连接 + 极高错误率
-            if same_dst >= 150 and serror_rate >= 0.9:
-                confidence = min(0.95 + serror_rate * 0.05, 1.0)
+        # 【规则1: SYN Flood DoS攻击检测 - 改进版】
+        if protocol == 6:  # TCP
+            is_syn = tcp_flags & 0x02  # 当前包是SYN
+            is_small_packet = packet_size <= self.dos_threshold['small_packet_size']
+            
+            # 条件1: 高频SYN包 + 无数据传输（经典SYN flood）
+            # serror_rate表示"只有SYN但没有PSH/FIN的连接"占比
+            if is_syn:
+                # 大量相同目标 + 较高错误率（半连接）
+                if same_dst >= self.dos_threshold['same_dst_count'] and serror_rate >= self.dos_threshold['serror_rate']:
+                    confidence = min(0.85 + serror_rate * 0.1 + same_dst * 0.001, 0.98)
+                    return 'dos', confidence
+                
+                # 中等数量的SYN到同一目标 + 高错误率（更敏感的检测）
+                if same_dst >= 10 and serror_rate >= 0.7:
+                    confidence = min(0.80 + serror_rate * 0.1, 0.92)
+                    return 'dos', confidence
+            
+            # 条件2: 小包高频（即使不是只有SYN也可能是flood）
+            if is_small_packet and same_dst >= 30 and serror_rate >= 0.6:
+                confidence = 0.82 + serror_rate * 0.1
                 return 'dos', confidence
 
-        # 【强规则2: 明显的暴力破解】
+        # 【规则2: 明显的暴力破解】
         if protocol == 6 and dst_port in self.r2l_threshold['failed_login_ports']:
             has_payload = (tcp_flags & 0x08) or packet_size >= self.r2l_threshold['large_payload']
             # 提高阈值，只在非常明显时触发
@@ -116,7 +136,7 @@ class HybridAttackDetector:
                 confidence = 0.80 + min(same_dst * 0.03, 0.15)
                 return 'r2l', confidence
 
-        # 【强规则3: 极明显的端口扫描】
+        # 【规则3: 极明显的端口扫描】
         if protocol == 6 and tcp_flags & 0x02:
             # 必须满足极严格的条件
             if (same_dst >= 200 and

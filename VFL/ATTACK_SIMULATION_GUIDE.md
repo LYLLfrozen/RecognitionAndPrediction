@@ -99,7 +99,7 @@ python simulate_attacks.py dos --target 192.168.1.100 --port 80 --count 1000
 ```powershell
 # 基本用法（使用本机真实IP）
 python simulate_attacks.py dos --target 192.168.1.100 --port 80 --count 1000
-
+python3 simulate_attacks.py dos --target 127.0.0.1 --port 80 --count 1000 
 # 参数说明：
 # --target: 目标IP地址（使用本机IP，不要用127.0.0.1）
 # --port: 目标端口

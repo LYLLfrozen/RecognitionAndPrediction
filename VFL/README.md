@@ -239,7 +239,7 @@ python3 realtime_monitor.py
 
 ### Q2: 启动时提示"需要root权限"？
 **A**: 真实流量捕获需要管理员权限：
-- macOS/Linux: 使用 `sudo python3 realtime_monitor.py`
+- macOS/Linux: 使用 `python3 realtime_monitor.py --interface lo0`
 - Windows: 以管理员身份运行命令行
 - 或者使用模拟模式: `python3 realtime_monitor.py --sim`
 

@@ -430,7 +430,7 @@ class RealTimeFlowMonitor:
                         # 直接计算模型输出
                         pred_class, confidence, all_probs = self.classifier.classify(flow_data)
                         print(f"[诊断] 模型预测: {pred_class}, confidence={confidence:.4f}")
-                        print(f"[诊断] 所有概率: {', '.join([f'{classifier.class_names[i]}={all_probs[i]:.3f}' for i in range(len(all_probs))])}")
+                        print(f"[诊断] 所有概率: {', '.join([f'{self.classifier.class_names[i]}={all_probs[i]:.3f}' for i in range(len(all_probs))])}")
                     except Exception as e:
                         print(f"[诊断] 快速预测失败: {e}")
 
@@ -1231,16 +1231,26 @@ class MonitorGUI:
         if class_counts and sum(class_counts.values()) > 0:
             labels = []
             sizes = []
-            colors = ['#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#3498db']
+            pie_colors = []
+            
+            # 固定类别颜色映射：normal=绿色, dos=红色
+            color_map = {
+                'normal': '#2ecc71',  # 绿色
+                'dos': '#e74c3c',     # 红色
+                'probe': '#f39c12',   # 橙色
+                'r2l': '#9b59b6',     # 紫色
+                'u2r': '#3498db'      # 蓝色
+            }
 
             for cls in sorted(class_counts.keys()):
                 if class_counts[cls] > 0:
                     labels.append(cls)
                     sizes.append(class_counts[cls])
+                    pie_colors.append(color_map.get(cls, '#95a5a6'))  # 默认灰色
 
             if sizes:
                 self.ax2.pie(sizes, labels=labels, autopct='%1.1f%%',
-                            colors=colors[:len(sizes)], startangle=90)
+                            colors=pie_colors, startangle=90)
                 self.ax2.axis('equal')
 
         self.canvas.draw()
