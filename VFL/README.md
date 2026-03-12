@@ -239,8 +239,10 @@ python3 realtime_monitor.py
 
 ### Q2: 启动时提示"需要root权限"？
 **A**: 真实流量捕获需要管理员权限：
-- macOS/Linux: 使用 `python3 realtime_monitor.py --interface lo0`
+- macOS/Linux: 使用 `python3 realtime_monitor.py --interface en0`
+  GUI：使用：`python3 run_monitor_gui.py --interface en0`
 - Windows: 以管理员身份运行命令行
+  GUI：使用：`python3 run_monitor_gui.py --interface en0`
 - 或者使用模拟模式: `python3 realtime_monitor.py --sim`
 
 ### Q3: 提示"scapy未安装"？
