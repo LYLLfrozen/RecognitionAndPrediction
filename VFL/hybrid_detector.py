@@ -14,13 +14,13 @@ class HybridAttackDetector:
         self.ml_classifier = ml_classifier
         self.flow_tracker = flow_tracker
         
-        # 检测阈值（调整后提高DoS检测灵敏度）
+        # 检测阈值（规则作为兜底机制，设置较高阈值减少触发频率）
         self.dos_threshold = {
-            'same_dst_count': 20,   # 降低阈值以便更早检测到SYN flood
-            'serror_rate': 0.5,     # 降低SYN错误率阈值
-            'syn_rate': 0.7,        # SYN包占比
-            'min_syn_count': 10,    # 最少SYN包数量
-            'small_packet_size': 100  # SYN包通常很小
+            'same_dst_count': 100,  # 大幅提高阈值，减少规则触发频率
+            'serror_rate': 0.8,     # 提高SYN错误率阈值
+            'syn_rate': 0.9,        # SYN包占比阈值提高
+            'min_syn_count': 50,    # 最少SYN包数量提高
+            'small_packet_size': 64  # 仅检测极小的SYN包
         }
         
         self.probe_threshold = {
@@ -47,7 +47,8 @@ class HybridAttackDetector:
     
     def detect(self, base_features, packet_info, flow_stats):
         """
-        混合检测（ML优先策略）
+        混合检测（ML主导策略）
+        规则引擎仅作为兜底机制，ML置信度 >= 0.5 时完全信任ML。
 
         Returns:
             (attack_type, confidence, method)
@@ -57,40 +58,50 @@ class HybridAttackDetector:
         processed = self.ml_classifier.preprocess_flow(enhanced_features)
         ml_pred, ml_conf, _ = self.ml_classifier.classify(processed)
 
-        # 2. 使用规则对ML结果进行验证和调整
-        rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
+        # 2. ML置信度 >= 0.5：完全信任ML，规则引擎不介入
+        if ml_conf >= 0.5:
+            # 对低置信度 probe 结果做防误判校验（避免正常流量被误标为探测）
+            if ml_pred == 'probe' and ml_conf < 0.8:
+                protocol = packet_info.get('protocol', 0)
+                dst_port = packet_info.get('dst_port', 0)
+                same_dst = flow_stats.get('same_dst_count', 0)
+                diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
+                serror_rate = flow_stats.get('serror_rate', 0)
+                is_scan_like = (
+                    protocol == 6 and
+                    same_dst >= 50 and
+                    diff_srv_rate >= 0.8 and
+                    serror_rate >= 0.6 and
+                    dst_port not in self.normal_indicators['common_ports']
+                )
+                if not is_scan_like:
+                    return 'normal', min(0.8, max(ml_conf, 0.6)), 'ml'
+            return ml_pred, ml_conf, 'ml'
 
-        if rule_result:
-            # 规则检测到强特征，覆盖ML结果
-            attack_type, confidence = rule_result
-            return attack_type, confidence, 'rule'
+        # 3. ML置信度中等（0.35 <= ml_conf < 0.5）：ML仍为主
+        #    规则仅在与ML意见一致时小幅提升置信度，不允许覆盖ML结果
+        elif ml_conf >= 0.35:
+            rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
+            if rule_result:
+                attack_type, rule_conf = rule_result
+                if attack_type == ml_pred:
+                    # ML与规则意见一致，小幅提升置信度，保持ML标签
+                    boosted_conf = min(ml_conf + 0.15, 0.80)
+                    return ml_pred, boosted_conf, 'ml'
+            return ml_pred, ml_conf, 'ml'
 
-        # 3. 对ML结果进行后处理
-        # 对 ML 输出的 probe 结果做额外校验，避免将正常流量误判为探测
-        if ml_pred == 'probe':
-            protocol = packet_info.get('protocol', 0)
-            dst_port = packet_info.get('dst_port', 0)
-            same_dst = flow_stats.get('same_dst_count', 0)
-            diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
-            serror_rate = flow_stats.get('serror_rate', 0)
-
-            # 端口扫描的一般模式
-            is_scan_like = (
-                protocol == 6 and
-                same_dst >= 15 and  # 降低阈值，让更多流量被ML识别
-                diff_srv_rate >= 0.6 and  # 降低阈值
-                serror_rate >= 0.4 and  # 降低阈值
-                dst_port not in self.normal_indicators['common_ports']
-            )
-
-            # 如果不符合扫描模式，降级为normal
-            if not is_scan_like:
-                return 'normal', min(0.8, max(ml_conf, 0.6)), 'ml'
-
-        return ml_pred, ml_conf, 'ml'
+        # 4. ML置信度很低（< 0.35）：规则可作为兜底
+        #    但需极高置信度（>= 0.92）才能覆盖ML
+        else:
+            rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
+            if rule_result:
+                attack_type, rule_conf = rule_result
+                if rule_conf >= 0.92:
+                    return attack_type, rule_conf, 'rule'
+            return ml_pred, ml_conf, 'ml'
     
     def _rule_based_verification(self, base_features, packet_info, flow_stats, ml_pred, ml_conf):
-        """基于规则的验证（改进的DoS检测）"""
+        """基于规则的验证（仅作为ML的兜底机制）"""
 
         # 提取关键特征
         protocol = packet_info.get('protocol', 0)
@@ -105,55 +116,52 @@ class HybridAttackDetector:
         psh_count = flow_stats.get('psh_count', 0)
         fin_count = flow_stats.get('fin_count', 0)
 
-        # 【规则1: SYN Flood DoS攻击检测 - 改进版】
+        # ML置信度 >= 0.5 时不介入（已在 detect() 中拦截，此处作双重保障）
+        if ml_conf >= 0.5:
+            return None
+
+        # 【规则1: SYN Flood DoS攻击检测 - 高阈值版本】
+        # 仅在出现非常明显的DoS特征时触发
         if protocol == 6:  # TCP
             is_syn = tcp_flags & 0x02  # 当前包是SYN
             is_small_packet = packet_size <= self.dos_threshold['small_packet_size']
-            
-            # 条件1: 高频SYN包 + 无数据传输（经典SYN flood）
-            # serror_rate表示"只有SYN但没有PSH/FIN的连接"占比
-            if is_syn:
-                # 大量相同目标 + 较高错误率（半连接）
-                if same_dst >= self.dos_threshold['same_dst_count'] and serror_rate >= self.dos_threshold['serror_rate']:
-                    confidence = min(0.85 + serror_rate * 0.1 + same_dst * 0.001, 0.98)
-                    return 'dos', confidence
-                
-                # 中等数量的SYN到同一目标 + 高错误率（更敏感的检测）
-                if same_dst >= 10 and serror_rate >= 0.7:
-                    confidence = min(0.80 + serror_rate * 0.1, 0.92)
-                    return 'dos', confidence
-            
-            # 条件2: 小包高频（即使不是只有SYN也可能是flood）
-            if is_small_packet and same_dst >= 30 and serror_rate >= 0.6:
-                confidence = 0.82 + serror_rate * 0.1
+
+            # 条件1: 大量相同目标 + 极高错误率（经典SYN flood）
+            if is_syn and same_dst >= self.dos_threshold['same_dst_count'] and serror_rate >= self.dos_threshold['serror_rate']:
+                confidence = min(0.90 + serror_rate * 0.08 + same_dst * 0.0005, 0.99)
                 return 'dos', confidence
 
-        # 【规则2: 明显的暴力破解】
+            # 条件2: 极端小包高频攻击
+            if is_small_packet and same_dst >= 200 and serror_rate >= 0.9:
+                confidence = 0.92 + serror_rate * 0.06
+                return 'dos', confidence
+
+        # 【规则2: 非常明显的暴力破解】
         if protocol == 6 and dst_port in self.r2l_threshold['failed_login_ports']:
             has_payload = (tcp_flags & 0x08) or packet_size >= self.r2l_threshold['large_payload']
-            # 提高阈值，只在非常明显时触发
-            if same_dst >= 5 and has_payload:
-                confidence = 0.80 + min(same_dst * 0.03, 0.15)
+            # 仅在高频失败登录时触发
+            if same_dst >= 20 and has_payload:
+                confidence = 0.85 + min(same_dst * 0.02, 0.12)
                 return 'r2l', confidence
 
-        # 【规则3: 极明显的端口扫描】
+        # 【规则3: 极端明显的端口扫描】
         if protocol == 6 and tcp_flags & 0x02:
             # 必须满足极严格的条件
-            if (same_dst >= 200 and
-                diff_srv_rate >= 0.95 and
-                serror_rate > 0.85 and
+            if (same_dst >= 500 and
+                diff_srv_rate >= 0.98 and
+                serror_rate > 0.9 and
                 dst_port not in self.normal_indicators['common_ports']):
-                confidence = 0.92 + diff_srv_rate * 0.05
+                confidence = 0.95 + diff_srv_rate * 0.03
                 return 'probe', confidence
 
-        # 【强规则4: ICMP/UDP Flood】
-        if protocol == 1 and same_dst >= 100:  # ICMP
-            return 'dos', 0.90
+        # 【强规则4: 大规模ICMP/UDP Flood】
+        if protocol == 1 and same_dst >= 500:  # ICMP
+            return 'dos', 0.95
 
-        if protocol == 17 and dst_port != 53 and same_dst >= 100:  # UDP非DNS
-            return 'dos', 0.88
+        if protocol == 17 and dst_port != 53 and same_dst >= 500:  # UDP非DNS
+            return 'dos', 0.93
 
-        # 其他情况：信任ML的判断
+        # 其他情况：信任ML的判断或继续使用低置信度结果
         return None
 
 
