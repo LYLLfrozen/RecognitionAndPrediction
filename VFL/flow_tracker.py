@@ -80,12 +80,24 @@ class FlowTracker:
         features = self._compute_flow_features(flow, packet_info, timestamp)
         
         # 记录到全局历史
+        # 使用归一化服务端口（取非临时端口一侧），避免双向流量导致diff_srv_rate虚高
+        service_port = self._get_service_port(
+            packet_info.get('src_port', 0),
+            packet_info.get('dst_port', 0)
+        )
+        # 使用归一化服务端 IP：请求包和回包都指向同一个服务端 IP（修复 Problem 1/2）
+        server_ip = self._get_server_ip(
+            packet_info['src_ip'], packet_info['dst_ip'],
+            packet_info.get('src_port', 0), packet_info.get('dst_port', 0)
+        )
         self.recent_conns.append({
             'key': flow_key,
             'time': timestamp,
             'dst_ip': packet_info['dst_ip'],
+            'server_ip': server_ip,
             'dst_port': packet_info.get('dst_port', 0),
-            'service': self._identify_service(packet_info.get('dst_port', 0)),
+            'service_port': service_port,
+            'service': self._identify_service(service_port),
             'features': features
         })
         
@@ -112,42 +124,75 @@ class FlowTracker:
             features['fin_count'] = sum(1 for f in flow['flags'] if f & 0x01)
             features['rst_count'] = sum(1 for f in flow['flags'] if f & 0x04)
             features['psh_count'] = sum(1 for f in flow['flags'] if f & 0x08)
+            features['ack_count'] = sum(1 for f in flow['flags'] if f & 0x10)
         else:
             features['syn_count'] = 0
             features['fin_count'] = 0
             features['rst_count'] = 0
             features['psh_count'] = 0
+            features['ack_count'] = 0
         
         # 时间窗口统计 (最近2秒)
-        recent_same_dst = [c for c in self.recent_conns 
+        # 修复 Problem 1/2：用归一化的 server_ip 过滤，而非原始 dst_ip。
+        # 回包时 dst_ip=本机，原先会把所有来自不同服务的回包混在一起，
+        # 导致 diff_srv_rate 虚高（Problem 1）及 serror_rate 虚高（Problem 2）。
+        cur_server_ip = self._get_server_ip(
+            packet_info['src_ip'], packet_info['dst_ip'],
+            packet_info.get('src_port', 0), packet_info.get('dst_port', 0)
+        )
+        recent_same_dst = [c for c in self.recent_conns
                           if timestamp - c['time'] <= self.window_time
-                          and c['dst_ip'] == packet_info['dst_ip']]
+                          and c.get('server_ip', c['dst_ip']) == cur_server_ip]
         
         features['same_dst_count'] = len(recent_same_dst)
         
-        # 服务统计
-        dst_port = packet_info.get('dst_port', 0)
+        # 服务统计：使用归一化服务端口（取非临时端口一侧）
+        # 这样 60000→10808 和 10808→60000 两个方向都算作访问 service_port=10808，
+        # 避免回包的临时端口让 diff_srv_rate 虚高
+        cur_service_port = self._get_service_port(
+            packet_info.get('src_port', 0),
+            packet_info.get('dst_port', 0)
+        )
         recent_same_srv = [c for c in recent_same_dst 
-                          if c['dst_port'] == dst_port]
+                          if c.get('service_port', c['dst_port']) == cur_service_port]
         features['same_srv_count'] = len(recent_same_srv)
         
-        # 错误率统计 (基于RST和未完成的连接)
-        # serror_rate: SYN错误率，即发送SYN但被RST的比率
-        # rerror_rate: REJ错误率，即连接被拒绝的比率
+        # 错误率统计
+        # serror_rate: 失败SYN连接占比
+        # 关键修复：查询连接的"当前最新"flags状态而非记录时的快照，
+        # 避免将"握手中但尚未传数据的正常连接"（syn=2, rst=0, psh=0）误判为失败连接。
+        # 判定规则：当前流有 SYN + RST 且无 PSH/FIN → 真正的失败/被拒绝连接
         if recent_same_dst:
-            # 统计只有SYN的连接（可能的半连接/失败连接）
-            syn_only = sum(1 for c in recent_same_dst 
-                          if c['features'].get('syn_count', 0) > 0 and 
-                             c['features'].get('psh_count', 0) == 0 and
-                             c['features'].get('fin_count', 0) == 0)
-            # 统计有RST的连接（连接被重置）
-            rst_count = sum(1 for c in recent_same_dst 
-                           if c['features'].get('rst_count', 0) > 0)
-            
-            # 错误率：异常连接占比
-            # 正常连接应该有PSH或FIN，只有SYN的很可能是扫描或失败连接
+            syn_only = 0
+            rst_total = 0
+            for c in recent_same_dst:
+                fkey = c['key']
+                if fkey in self.connections:
+                    cur_flags = self.connections[fkey]['flags']
+                    cur_syn = sum(1 for f in cur_flags if f & 0x02)
+                    cur_rst = sum(1 for f in cur_flags if f & 0x04)
+                    cur_psh = sum(1 for f in cur_flags if f & 0x08)
+                    cur_fin = sum(1 for f in cur_flags if f & 0x01)
+                    cur_ack = sum(1 for f in cur_flags if f & 0x10)
+                else:
+                    # 连接已被清理，回退到快照
+                    cur_syn = c['features'].get('syn_count', 0)
+                    cur_rst = c['features'].get('rst_count', 0)
+                    cur_psh = c['features'].get('psh_count', 0)
+                    cur_fin = c['features'].get('fin_count', 0)
+                    cur_ack = c['features'].get('ack_count', 0)
+                # 失败连接判定（与KDD99 S0/REJ 对齐）：
+                # 条件：有SYN + 无数据(PSH=0) + 无正常关闭(FIN=0) +
+                #       且 (从未收到ACK响应=S0型) 或 (收到RST=被拒绝型)
+                # 这能正确检测SYN洪泛：伪造源IP时SYN+ACK回到不存在地址，
+                # 监测机只看到发出的SYN包，cur_ack=0，因此被正确计为失败连接。
+                # 正常连接：SYN+ACK被监测到 → cur_ack>0 → 不计为失败。
+                if cur_syn > 0 and cur_psh == 0 and cur_fin == 0 and (cur_ack == 0 or cur_rst > 0):
+                    syn_only += 1
+                if cur_rst > 0:
+                    rst_total += 1
             features['serror_rate'] = syn_only / len(recent_same_dst)
-            features['rerror_rate'] = rst_count / len(recent_same_dst)
+            features['rerror_rate'] = rst_total / len(recent_same_dst)
         else:
             features['serror_rate'] = 0
             features['rerror_rate'] = 0
@@ -162,6 +207,32 @@ class FlowTracker:
         
         return features
     
+    def _get_service_port(self, src_port, dst_port):
+        """
+        返回连接的"服务端"端口（非临时端口一侧）。
+        临时端口定义为 >= 32768（覆盖 Linux/macOS 的随机端口范围）。
+        用于 same_srv 统计，避免双向流量导致 diff_srv_rate 虚高。
+        """
+        EPHEMERAL = 32768
+        if dst_port < EPHEMERAL:
+            return dst_port      # 目标是固定服务端口（客户端→服务端）
+        if src_port < EPHEMERAL:
+            return src_port      # 源是固定服务端口（服务端→客户端的回包）
+        return dst_port          # 两端都是高端口，保持 dst_port
+
+    def _get_server_ip(self, src_ip, dst_ip, src_port, dst_port):
+        """
+        返回连接的"服务端" IP（非临时端口所在侧）。
+        用于 same_dst 统计：请求包(dst_ip=服务端)和回包(dst_ip=本机)
+        都映射到同一个服务端 IP，避免 diff_srv_rate / serror_rate 虚高。
+        """
+        EPHEMERAL = 32768
+        if dst_port < EPHEMERAL:
+            return dst_ip   # client→server：服务端是 dst
+        if src_port < EPHEMERAL:
+            return src_ip   # server→client 回包：服务端是 src
+        return dst_ip       # 两端都是高端口，默认取 dst
+
     def _identify_service(self, port):
         """识别服务类型"""
         services = {
@@ -213,6 +284,7 @@ class FlowTracker:
             enhanced[23] = features_dict.get('fin_count', 0) / 10.0
             enhanced[24] = features_dict.get('rst_count', 0) / 10.0
             enhanced[25] = features_dict.get('psh_count', 0) / 10.0
+            enhanced[26] = features_dict.get('ack_count', 0) / 10.0  # ACK计数（用于流级flag判断）
         
         return enhanced
 

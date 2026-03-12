@@ -143,39 +143,141 @@ class VFLFlowClassifier:
         # 检查输入维度
         original_dim = flow_data.shape[-1]
         
-        # 如果是41维（增强的真实包特征），使用改进的归一化
+        # 如果是41维（增强的真实包特征），映射到 KDD Cup 99 的115维格式再用训练scaler归一化
         if original_dim == 41:
-            # 手动归一化：根据实际网络特征的合理范围
-            normalized = np.zeros(41)
-            
-            # 包长度和IP长度：归一化到[0,1]，假设最大1500
-            normalized[0] = min(flow_data[0] / 1500.0, 1.0)
-            normalized[6] = min(flow_data[6] / 1500.0, 1.0)
-            
-            # 协议类型：已经是离散值(1/6/17)，除以20归一化
-            normalized[1] = flow_data[1] / 20.0
-            
-            # 端口号：归一化到[0,1]
-            normalized[2] = flow_data[2] / 65535.0
-            normalized[3] = flow_data[3] / 65535.0
-            
-            # TCP flags：归一化到[0,1]
-            normalized[4] = flow_data[4] / 255.0
-            
-            # TTL：归一化到[0,1]，假设最大255
-            normalized[5] = flow_data[5] / 255.0
-            
-            # 其他基础特征：直接复制（已经是归一化范围）
-            normalized[7:13] = flow_data[7:13]
-            
-            # 流统计特征（索引13+）：这些已经在flow_tracker中归一化
-            if flow_data.shape[0] > 13:
-                normalized[13:] = flow_data[13:]
-            
-            flow_data = normalized
-            
-            # 扩展到121维（填充零）
-            padding = np.zeros(121 - 41)
+            # ── 解析41维特征向量中的各字段 ──
+            protocol   = int(flow_data[1])
+            src_port   = int(flow_data[2])
+            dst_port   = int(flow_data[3])
+            tcp_flags  = int(flow_data[4])
+            # flow_tracker 写入的流统计（features_to_vector 中已归一化，此处还原）
+            duration       = float(flow_data[13])
+            src_bytes      = float(flow_data[14]) * 10000.0
+            same_dst_count = float(flow_data[16]) * 100.0
+            same_srv_count = float(flow_data[17]) * 100.0
+            serror_rate    = float(flow_data[18])
+            rerror_rate    = float(flow_data[19])
+            same_srv_rate  = float(flow_data[20])
+            diff_srv_rate  = float(flow_data[21])
+
+            # TCP flags 各位
+            syn = bool(tcp_flags & 0x02)
+            ack = bool(tcp_flags & 0x10)
+            fin = bool(tcp_flags & 0x01)
+            rst = bool(tcp_flags & 0x04)
+            psh = bool(tcp_flags & 0x08)
+
+            kdd = np.zeros(115)
+
+            # ── 基础连接特征（KDD 0-18）──
+            kdd[0] = duration    # duration
+            kdd[1] = src_bytes   # src_bytes
+            # kdd[2] dst_bytes = 0（反向流量未跟踪）
+            # kdd[3:8] = 0（land / wrong_fragment / urgent / hot / num_failed_logins）
+            # logged_in：已建立连接（ACK且非纯SYN握手）
+            login_ports = {21, 22, 23, 513, 514}
+            service_port_for_login = dst_port if dst_port < 32768 else src_port
+            kdd[8] = 1 if (ack and not syn and service_port_for_login in login_ports) else 0
+            # kdd[9:19] = 0（高层语义特征无法从原始包获得）
+
+            # ── 时间窗口统计特征（KDD 19-37）──
+            kdd[19] = same_dst_count   # count
+            kdd[20] = same_srv_count   # srv_count
+            kdd[21] = serror_rate      # serror_rate
+            kdd[22] = serror_rate      # srv_serror_rate（近似）
+            kdd[23] = rerror_rate      # rerror_rate
+            kdd[24] = rerror_rate      # srv_rerror_rate（近似）
+            kdd[25] = same_srv_rate    # same_srv_rate
+            kdd[26] = diff_srv_rate    # diff_srv_rate
+            # kdd[27] = 0  srv_diff_host_rate（未跟踪）
+            kdd[28] = same_dst_count   # dst_host_count
+            kdd[29] = same_srv_count   # dst_host_srv_count
+            kdd[30] = same_srv_rate    # dst_host_same_srv_rate
+            kdd[31] = diff_srv_rate    # dst_host_diff_srv_rate
+            # kdd[32:34] = 0
+            kdd[34] = serror_rate      # dst_host_serror_rate
+            kdd[35] = serror_rate      # dst_host_srv_serror_rate
+            kdd[36] = rerror_rate      # dst_host_rerror_rate
+            kdd[37] = rerror_rate      # dst_host_srv_rerror_rate
+
+            # ── 协议类型 one-hot（38-39，icmp=两者均0）──
+            kdd[38] = 1 if protocol == 6  else 0  # protocol_type_tcp
+            kdd[39] = 1 if protocol == 17 else 0  # protocol_type_udp
+
+            # ── 服务类型 one-hot（40-104）──
+            # 端口→KDD服务索引映射（仅常见端口）
+            _SVC_MAP = {
+                20: 58, 21: 57, 22: 91, 23: 95, 25: 89,
+                37: 98, 42: 71, 43: 104, 53: 49, 70: 59,
+                79: 56, 80: 61, 101: 60, 105: 45, 109: 81,
+                110: 82, 111: 92, 113: 42, 119: 77, 143: 63,
+                179: 43, 389: 67, 433: 76, 443: 62, 512: 55,
+                513: 69, 514: 88, 515: 83, 530: 44, 540: 101,
+                543: 65, 544: 66, 6000: 40,
+            }
+            if protocol == 1:  # ICMP：type 储存在 src_port 位置
+                kdd[52 if src_port == 8 else 53] = 1  # eco_i(8) 或 ecr_i(0)
+            else:
+                # 使用非临时端口一侧作为服务端口
+                svc_port = dst_port if dst_port < 32768 else src_port
+                if protocol == 17 and svc_port == 53:
+                    kdd[50] = 1  # domain_u（UDP DNS）
+                else:
+                    svc_idx = _SVC_MAP.get(svc_port, 84 if svc_port > 1024 else 79)
+                    kdd[svc_idx] = 1
+
+            # ── 连接flag one-hot（105-114）──
+            # 优先使用流级统计（positions 22-26），这比单包tcp_flags更准确：
+            #   - SYN flood：每条流仅有SYN(ack_c=0)  → S0，与KDD99 neptune特征一致
+            #   - 正常连接：SYN+ACK到达后ack_c>0，PSH传数据后psh_c>0 → SF
+            #   - 单包per-packet判断会把每个正常SYN都错误映射为S0
+            flow_syn_c = round(float(flow_data[22]) * 10.0) if len(flow_data) > 22 else 0
+            flow_fin_c = round(float(flow_data[23]) * 10.0) if len(flow_data) > 23 else 0
+            flow_rst_c = round(float(flow_data[24]) * 10.0) if len(flow_data) > 24 else 0
+            flow_psh_c = round(float(flow_data[25]) * 10.0) if len(flow_data) > 25 else 0
+            flow_ack_c = round(float(flow_data[26]) * 10.0) if len(flow_data) > 26 else 0
+
+            # 判断是否有有效的流级统计（非零数据则使用流级判断）
+            has_flow_stats = (flow_syn_c + flow_fin_c + flow_rst_c + flow_psh_c + flow_ack_c) > 0
+
+            if has_flow_stats:
+                # 流级 KDD flag 映射（与KDD99定义完全对齐）
+                if flow_rst_c > 0:
+                    # RSTOS0：SYN已发出但收到RST（且无ACK） / REJ：其他RST情况
+                    kdd[107 if (flow_syn_c > 0 and flow_ack_c == 0) else 105] = 1
+                elif flow_syn_c > 0 and flow_ack_c == 0 and flow_psh_c == 0 and flow_fin_c == 0:
+                    kdd[109] = 1   # S0：SYN已发，从未收到ACK响应（SYN flood典型特征）
+                elif flow_psh_c > 0 or flow_fin_c > 0:
+                    kdd[113] = 1   # SF：有数据传输或正常关闭
+                elif flow_syn_c > 0 and flow_ack_c > 0:
+                    kdd[110] = 1   # S1：握手中（收到SYN+ACK但无数据）
+                else:
+                    kdd[113] = 1   # SF：默认（纯ACK流量）
+            else:
+                # 回退：使用单包tcp_flags（仅在flow_tracker统计不可用时）
+                if rst:
+                    kdd[107 if (syn and not ack) else 105] = 1  # RSTOS0 或 REJ
+                elif syn and not ack and not fin:
+                    kdd[109] = 1   # S0
+                elif syn and ack and not fin and not rst:
+                    kdd[110] = 1   # S1
+                else:
+                    kdd[113] = 1   # SF
+
+            flow_data = kdd
+
+            # 应用训练时的 StandardScaler，使特征分布与训练数据一致
+            scaler = (self.processor.get('scaler')
+                      if isinstance(self.processor, dict)
+                      else getattr(self.processor, 'scaler', None))
+            if scaler is not None:
+                try:
+                    flow_data = scaler.transform(flow_data.reshape(1, -1))[0]
+                except Exception:
+                    pass
+
+            # 填充到121维
+            padding = np.zeros(121 - 115)
             flow_data = np.concatenate([flow_data, padding])
         
         # 如果是115维（训练格式），使用 scaler 并填充到121

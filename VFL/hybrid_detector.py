@@ -39,10 +39,15 @@ class HybridAttackDetector:
         
         # 正常流量特征（用于优先识别）
         self.normal_indicators = {
-            'common_ports': [80, 443, 53, 8080, 8443, 8000, 9000],  # 常见正常服务端口
-            'max_same_dst': 80,     # 大幅提高正常流量连接数上限（浏览器可能并发很多请求）
-            'typical_flags': [0x02, 0x10, 0x18],  # SYN, ACK, PSH+ACK
-            'min_error_for_attack': 0.6  # 攻击通常有更高的错误率
+            # 常见正常服务端口（含本地代理常用端口）
+            'common_ports': [
+                80, 443, 53, 8080, 8443, 8000, 9000,
+                10808, 7890, 7891, 1080, 1086, 1087, 1088,  # 常见本地代理端口（Clash/V2Ray等）
+                2222, 2022,                                   # 非标准SSH端口
+            ],
+            'max_same_dst': 80,
+            'typical_flags': [0x02, 0x10, 0x18],
+            'min_error_for_attack': 0.6
         }
     
     def detect(self, base_features, packet_info, flow_stats):
@@ -60,27 +65,20 @@ class HybridAttackDetector:
 
         # 2. ML置信度 >= 0.5：完全信任ML，规则引擎不介入
         if ml_conf >= 0.5:
-            # 对低置信度 probe 结果做防误判校验（避免正常流量被误标为探测）
-            if ml_pred == 'probe' and ml_conf < 0.8:
-                protocol = packet_info.get('protocol', 0)
-                dst_port = packet_info.get('dst_port', 0)
-                same_dst = flow_stats.get('same_dst_count', 0)
-                diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
-                serror_rate = flow_stats.get('serror_rate', 0)
-                is_scan_like = (
-                    protocol == 6 and
-                    same_dst >= 50 and
-                    diff_srv_rate >= 0.8 and
-                    serror_rate >= 0.6 and
-                    dst_port not in self.normal_indicators['common_ports']
-                )
-                if not is_scan_like:
+            # probe/u2r 无论置信度多高，都进行流量特征核验以防误判
+            # （正常流量不应出现 diff_srv_rate>=0.6 且 serror_rate>=0.5 的组合）
+            if ml_pred in ('probe', 'u2r'):
+                if not self._verify_probe_u2r(ml_pred, packet_info, flow_stats):
                     return 'normal', min(0.8, max(ml_conf, 0.6)), 'ml'
             return ml_pred, ml_conf, 'ml'
 
         # 3. ML置信度中等（0.35 <= ml_conf < 0.5）：ML仍为主
         #    规则仅在与ML意见一致时小幅提升置信度，不允许覆盖ML结果
         elif ml_conf >= 0.35:
+            # 中等置信度下 probe/u2r 更容易误判，同样需要流量验证
+            if ml_pred in ('probe', 'u2r'):
+                if not self._verify_probe_u2r(ml_pred, packet_info, flow_stats):
+                    return 'normal', 0.65, 'ml'
             rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
             if rule_result:
                 attack_type, rule_conf = rule_result
@@ -100,12 +98,57 @@ class HybridAttackDetector:
                     return attack_type, rule_conf, 'rule'
             return ml_pred, ml_conf, 'ml'
     
+    def _verify_probe_u2r(self, ml_pred, packet_info, flow_stats):
+        """
+        验证 probe/u2r 预测是否有足够的流量特征支撑。
+        返回 True 表示预测可信，False 表示很可能是正常流量误判。
+        """
+        protocol = packet_info.get('protocol', 0)
+        src_port = packet_info.get('src_port', 0)
+        dst_port = packet_info.get('dst_port', 0)
+        # 归一化服务端口：回包时 dst_port=临时端口，需取 src_port（服务端真实端口）
+        service_port = self.flow_tracker._get_service_port(src_port, dst_port)
+        same_dst = flow_stats.get('same_dst_count', 0)
+        diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
+        serror_rate = flow_stats.get('serror_rate', 0)
+
+        if ml_pred == 'probe':
+            # 端口扫描的真实特征：
+            # 1. 针对非临时的固定服务端口（service_port < 32768），不会扫描随机高端口
+            # 2. diff_srv_rate 高（flow_tracker 修复后此值将真实反映多目标端口）
+            # 3. serror_rate 高（大多数连接被RST拒绝）—— 修复后此值不含握手中连接
+            # 正常流量（修复后）：diff_srv_rate ≈ 0，serror_rate ≈ 0
+            return (
+                protocol == 6 and
+                same_dst >= 20 and
+                diff_srv_rate >= 0.6 and
+                serror_rate >= 0.5 and
+                service_port < 32768 and              # 真实扫描目标服务端口，非临时端口
+                service_port not in self.normal_indicators['common_ports']  # 白名单放行（Problem 3）
+            )
+
+        elif ml_pred == 'u2r':
+            # U2R：低频（非批量）+ 大载荷 + 针对具体服务端口
+            # 正常流量不会携带超大 payload 去攻击本地提权漏洞
+            packet_size = packet_info.get('packet_size', 0)
+            tcp_flags = packet_info.get('tcp_flags', 0)
+            src_bytes = flow_stats.get('src_bytes', 0)
+            has_large_payload = packet_size > 500 or src_bytes > 10000
+            is_service_port = dst_port in [21, 22, 23, 25, 80, 110, 111, 513, 514, 2049]
+            is_low_freq = same_dst < 15  # u2r 通常不产生大量连接
+            return is_service_port and has_large_payload and is_low_freq
+
+        return True  # 其他类型默认信任 ML
+
     def _rule_based_verification(self, base_features, packet_info, flow_stats, ml_pred, ml_conf):
         """基于规则的验证（仅作为ML的兜底机制）"""
 
         # 提取关键特征
         protocol = packet_info.get('protocol', 0)
+        src_port = packet_info.get('src_port', 0)
         dst_port = packet_info.get('dst_port', 0)
+        # 归一化服务端口：回包时 dst_port=临时端口，需取 src_port（服务端真实端口）（Problem 3）
+        service_port = self.flow_tracker._get_service_port(src_port, dst_port)
         tcp_flags = packet_info.get('tcp_flags', 0)
         packet_size = packet_info.get('packet_size', 0)
 
@@ -146,11 +189,11 @@ class HybridAttackDetector:
 
         # 【规则3: 极端明显的端口扫描】
         if protocol == 6 and tcp_flags & 0x02:
-            # 必须满足极严格的条件
+            # 必须满足极严格的条件；使用 service_port 匹配白名单（Problem 3 修复）
             if (same_dst >= 500 and
                 diff_srv_rate >= 0.98 and
                 serror_rate > 0.9 and
-                dst_port not in self.normal_indicators['common_ports']):
+                service_port not in self.normal_indicators['common_ports']):
                 confidence = 0.95 + diff_srv_rate * 0.03
                 return 'probe', confidence
 
