@@ -275,7 +275,7 @@ python3 generate_test_traffic.py
 
 ### Q7: 为什么有部分流量都被识别为probe？
 **A**: 这是正常现象：
-- HTTPS被误判为r2l是KDD99训练数据的历史局限（1999年HTTPS很少见，r2l的"登录型攻击"在那时会使用类似的SF+低count特征）。
+- HTTPS被误判为probe是KDD99训练数据的历史局限（1999年HTTPS很少见，probe的"扫描型攻击"在那时会使用类似的SF+低count特征）。
 - 这是数据集质量问题。
 
 ## 技术架构

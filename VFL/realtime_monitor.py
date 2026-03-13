@@ -243,8 +243,15 @@ class VFLFlowClassifier:
             if has_flow_stats:
                 # 流级 KDD flag 映射（与KDD99定义完全对齐）
                 if flow_rst_c > 0:
-                    # RSTOS0：SYN已发出但收到RST（且无ACK） / REJ：其他RST情况
-                    kdd[107 if (flow_syn_c > 0 and flow_ack_c == 0) else 105] = 1
+                    if flow_syn_c > 0 and flow_ack_c == 0:
+                        kdd[107] = 1  # RSTOS0：SYN已发但收到RST且无ACK
+                    elif (flow_syn_c > 0 and flow_ack_c > 0 and
+                          same_dst_count >= 20 and serror_rate >= 0.6 and diff_srv_rate <= 0.3):
+                        # 本地回环DoS：TCP栈回RST|ACK导致ack_c>0，但统计特征符合SYN flood
+                        # （同一目标/服务的高失败率），与KDD99 neptune(S0)特征对齐
+                        kdd[109] = 1  # S0：DoS洪泛
+                    else:
+                        kdd[105] = 1  # REJ：真实端口扫描/连接拒绝
                 elif flow_syn_c > 0 and flow_ack_c == 0 and flow_psh_c == 0 and flow_fin_c == 0:
                     kdd[109] = 1   # S0：SYN已发，从未收到ACK响应（SYN flood典型特征）
                 elif flow_psh_c > 0 or flow_fin_c > 0:

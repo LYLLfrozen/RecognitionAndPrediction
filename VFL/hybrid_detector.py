@@ -16,10 +16,10 @@ class HybridAttackDetector:
         
         # 检测阈值（规则作为兜底机制，设置较高阈值减少触发频率）
         self.dos_threshold = {
-            'same_dst_count': 100,  # 大幅提高阈值，减少规则触发频率
-            'serror_rate': 0.8,     # 提高SYN错误率阈值
-            'syn_rate': 0.9,        # SYN包占比阈值提高
-            'min_syn_count': 50,    # 最少SYN包数量提高
+            'same_dst_count': 50,   # 降低阈值以提高DoS检测灵敏度
+            'serror_rate': 0.7,     # 降低SYN错误率阈值
+            'syn_rate': 0.9,        # SYN包占比阈值
+            'min_syn_count': 30,    # 最少SYN包数量
             'small_packet_size': 64  # 仅检测极小的SYN包
         }
         
@@ -63,21 +63,45 @@ class HybridAttackDetector:
         processed = self.ml_classifier.preprocess_flow(enhanced_features)
         ml_pred, ml_conf, _ = self.ml_classifier.classify(processed)
 
-        # 2. ML置信度 >= 0.5：完全信任ML，规则引擎不介入
+        # 1.5 DoS/Probe 冲突消解：
+        #     DoS通常集中攻击同一服务（diff_srv_rate低），Probe通常扫描多服务（diff_srv_rate高）。
+        #     若ML把集中洪泛流量判为probe，优先修正为dos。
+        resolved = self._resolve_probe_dos_conflict(ml_pred, ml_conf, packet_info, flow_stats)
+        if resolved is not None:
+            return resolved
+
+        # 2. DoS强特征优先兜底：
+        #    修复场景：本地SYN Flood时，ML可能高置信度误判为normal。
+        #    当流量统计满足典型DoS模式时，允许规则覆盖ML。
+        dos_rescue = self._check_dos_pattern(packet_info, flow_stats)
+        if dos_rescue:
+            dos_type, dos_conf = dos_rescue
+            # 仅在 ML 未明确给出高置信度 dos 时覆盖，避免无意义抖动。
+            if not (ml_pred == 'dos' and ml_conf >= 0.80):
+                return dos_type, max(dos_conf, 0.80), 'rule'
+
+        # 3. ML置信度 >= 0.5：完全信任ML，规则引擎不介入
         if ml_conf >= 0.5:
             # probe/u2r 无论置信度多高，都进行流量特征核验以防误判
             # （正常流量不应出现 diff_srv_rate>=0.6 且 serror_rate>=0.5 的组合）
             if ml_pred in ('probe', 'u2r'):
                 if not self._verify_probe_u2r(ml_pred, packet_info, flow_stats):
+                    # 验证失败时检查是否为DoS（防止回环DoS被误判为probe后归入normal）
+                    dos_rescue = self._check_dos_pattern(packet_info, flow_stats)
+                    if dos_rescue:
+                        return dos_rescue[0], dos_rescue[1], 'rule'
                     return 'normal', min(0.8, max(ml_conf, 0.6)), 'ml'
             return ml_pred, ml_conf, 'ml'
 
-        # 3. ML置信度中等（0.35 <= ml_conf < 0.5）：ML仍为主
+        # 4. ML置信度中等（0.35 <= ml_conf < 0.5）：ML仍为主
         #    规则仅在与ML意见一致时小幅提升置信度，不允许覆盖ML结果
         elif ml_conf >= 0.35:
             # 中等置信度下 probe/u2r 更容易误判，同样需要流量验证
             if ml_pred in ('probe', 'u2r'):
                 if not self._verify_probe_u2r(ml_pred, packet_info, flow_stats):
+                    dos_rescue = self._check_dos_pattern(packet_info, flow_stats)
+                    if dos_rescue:
+                        return dos_rescue[0], dos_rescue[1], 'rule'
                     return 'normal', 0.65, 'ml'
             rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
             if rule_result:
@@ -88,7 +112,7 @@ class HybridAttackDetector:
                     return ml_pred, boosted_conf, 'ml'
             return ml_pred, ml_conf, 'ml'
 
-        # 4. ML置信度很低（< 0.35）：规则可作为兜底
+        # 5. ML置信度很低（< 0.35）：规则可作为兜底
         #    但需极高置信度（>= 0.92）才能覆盖ML
         else:
             rule_result = self._rule_based_verification(base_features, packet_info, flow_stats, ml_pred, ml_conf)
@@ -97,6 +121,33 @@ class HybridAttackDetector:
                 if rule_conf >= 0.92:
                     return attack_type, rule_conf, 'rule'
             return ml_pred, ml_conf, 'ml'
+
+    def _resolve_probe_dos_conflict(self, ml_pred, ml_conf, packet_info, flow_stats):
+        """
+        解决 DoS 与 Probe 的边界冲突。
+        典型SYN Flood: same_dst高 + serror高 + diff_srv低（攻击集中在单端口）。
+        典型Probe: same_dst高 + diff_srv高（多端口/多服务扫描）。
+        """
+        protocol = packet_info.get('protocol', 0)
+        same_dst = flow_stats.get('same_dst_count', 0)
+        serror_rate = flow_stats.get('serror_rate', 0)
+        diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
+
+        if protocol != 6:
+            return None
+
+        # 仅在ML预测probe或normal时进行修正，避免覆盖稳定的dos预测
+        if ml_pred not in ('probe', 'normal'):
+            return None
+
+        # 集中式洪泛（单服务）应判为DoS，不应判为Probe
+        if same_dst >= 15 and serror_rate >= 0.45 and diff_srv_rate <= 0.35:
+            conf = min(0.78 + 0.12 * serror_rate + 0.002 * same_dst, 0.96)
+            # 当ML高置信probe但统计形态明显是DoS时，仍强制纠正
+            if ml_pred == 'probe' or ml_conf < 0.80:
+                return 'dos', conf, 'rule'
+
+        return None
     
     def _verify_probe_u2r(self, ml_pred, packet_info, flow_stats):
         """
@@ -139,6 +190,36 @@ class HybridAttackDetector:
             return is_service_port and has_large_payload and is_low_freq
 
         return True  # 其他类型默认信任 ML
+
+    def _check_dos_pattern(self, packet_info, flow_stats):
+        """
+        当ML预测probe/u2r验证失败时，检查是否为DoS攻击。
+        DoS特征：高same_dst_count + 高serror_rate + 低diff_srv_rate（集中攻击同一服务）。
+        与 _verify_probe_u2r 互补：probe需要高diff_srv_rate，DoS恰好相反（低diff_srv_rate）。
+
+        Returns: (attack_type, confidence) 或 None
+        """
+        protocol = packet_info.get('protocol', 0)
+        same_dst = flow_stats.get('same_dst_count', 0)
+        serror_rate = flow_stats.get('serror_rate', 0)
+        diff_srv_rate = flow_stats.get('diff_srv_rate', 0)
+        rerror_rate = flow_stats.get('rerror_rate', 0)
+
+        # TCP DoS：大量同目标连接 + 高失败率 + 集中攻击同一服务（低diff_srv_rate）
+        # 本地回环仿真和真实SYN flood都满足此条件
+        if protocol == 6 and same_dst >= 20 and serror_rate >= 0.6 and diff_srv_rate <= 0.3:
+            conf = min(0.70 + serror_rate * 0.15 + same_dst * 0.001, 0.95)
+            return 'dos', conf
+
+        # ICMP flood
+        if protocol == 1 and same_dst >= 30:
+            return 'dos', min(0.80 + same_dst * 0.001, 0.95)
+
+        # UDP flood（非DNS）
+        if protocol == 17 and same_dst >= 30 and (serror_rate + rerror_rate) >= 0.5:
+            return 'dos', min(0.75 + same_dst * 0.001, 0.93)
+
+        return None
 
     def _rule_based_verification(self, base_features, packet_info, flow_stats, ml_pred, ml_conf):
         """基于规则的验证（仅作为ML的兜底机制）"""

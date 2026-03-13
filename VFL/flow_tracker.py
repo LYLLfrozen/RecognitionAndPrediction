@@ -214,6 +214,10 @@ class FlowTracker:
         用于 same_srv 统计，避免双向流量导致 diff_srv_rate 虚高。
         """
         EPHEMERAL = 32768
+        # 双低端口场景（如 2000 <-> 80）：使用更小端口作为服务端口，
+        # 使请求/回包统一映射到同一服务，避免同一DoS被统计为多服务扫描。
+        if src_port < EPHEMERAL and dst_port < EPHEMERAL:
+            return min(src_port, dst_port)
         if dst_port < EPHEMERAL:
             return dst_port      # 目标是固定服务端口（客户端→服务端）
         if src_port < EPHEMERAL:
@@ -227,6 +231,11 @@ class FlowTracker:
         都映射到同一个服务端 IP，避免 diff_srv_rate / serror_rate 虚高。
         """
         EPHEMERAL = 32768
+        # 双低端口场景下，通过更小端口判定服务端方向，保证双向一致。
+        if src_port < EPHEMERAL and dst_port < EPHEMERAL:
+            if src_port <= dst_port:
+                return src_ip
+            return dst_ip
         if dst_port < EPHEMERAL:
             return dst_ip   # client→server：服务端是 dst
         if src_port < EPHEMERAL:
