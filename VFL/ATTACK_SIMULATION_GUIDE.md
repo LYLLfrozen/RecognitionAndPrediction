@@ -345,5 +345,5 @@ python realtime_monitor.py --sim
 ## 参考资料
 
 - KDD Cup 99数据集：http://kdd.ics.uci.edu/databases/kddcup99/kddcup99.html
-- 垂直联邦学习：[VFL_README.md](VFL_README.md)
+- 垂直联邦学习：[README.md](README.md)
 - 混合检测器：[hybrid_detector.py](hybrid_detector.py)

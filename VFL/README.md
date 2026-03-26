@@ -205,6 +205,139 @@ sudo python3 realtime_monitor.py --duration 60
    - `ml`: 机器学习模型检测（主要）
    - `rule`: 规则引擎检测（辅助）
 
+## 核心算法公式、推导与实现功能
+
+本节给出联邦学习、CNN、LSTM、PrivBox 的数学公式、推导过程与在项目中的功能定位。
+
+### 1. 垂直联邦学习（VFL）
+
+样本按特征维度切分，设共有 $K$ 个参与方：
+
+$$
+x_i = [x_i^{(1)}, x_i^{(2)}, \dots, x_i^{(K)}],\quad y_i \text{ 仅主动方持有}
+$$
+
+各方底层模型计算本地嵌入：
+
+$$
+h_i^{(k)} = f_k\left(x_i^{(k)}; \theta_k\right)
+$$
+
+服务器拼接并分类：
+
+$$
+z_i = \operatorname{Concat}(h_i^{(1)},\dots,h_i^{(K)}),\quad
+\hat{y}_i=g(z_i;\phi)
+$$
+
+交叉熵损失：
+
+$$
+\mathcal{L} = -\frac{1}{B}\sum_{i=1}^{B}\sum_{c=1}^{C}\mathbf{1}(y_i=c)\log p_{i,c}
+$$
+
+梯度切片回传（链式法则）：
+
+$$
+\frac{\partial \mathcal{L}}{\partial h_i^{(k)}}=
+\left(\frac{\partial \mathcal{L}}{\partial z_i}\right)_{\text{slice }k}
+$$
+
+参数更新：
+
+$$
+θ_k \leftarrow θ_k-η\frac{\partial \mathcal{L}}{\partial θ_k},\quad
+\phi \leftarrow \phi-\eta\frac{\partial \mathcal{L}}{\partial \phi}
+$$
+
+项目实现功能：
+- `VFL/federated_learning/vfl_client.py`：主动方/被动方本地前向与更新
+- `VFL/federated_learning/vfl_server.py`：嵌入聚合、顶层前向、梯度分发
+- `VFL/train_vfl.py`：训练主流程
+
+### 2. CNN（空间特征提取）
+
+卷积层：
+
+$$
+X^{(l)}_{c'} = \sigma\left(\sum_c W^{(l)}_{c',c}*X^{(l-1)}_c+b^{(l)}_{c'}\right)
+$$
+
+最大池化：
+
+$$
+Y_{i,j,c} = \max_{(u,v)\in\Omega(i,j)} X_{u,v,c}
+$$
+
+推导意义：通过局部感受野提取特征组合，池化降低噪声与维度。
+
+项目实现功能：
+- 各参与方底层网络采用 `Conv2d + BN + ReLU + MaxPool + Dropout`
+- 代码位于 `VFL/train_vfl.py`（VFL底层）与 `model/fl_woa_cnn_lstm/cnn_lstm_model.py`
+
+### 3. LSTM（时序依赖建模）
+
+门控方程：
+
+$$
+\begin{aligned}
+i_t &= \sigma(W_i x_t + U_i h_{t-1} + b_i) \\
+f_t &= \sigma(W_f x_t + U_f h_{t-1} + b_f) \\
+o_t &= \sigma(W_o x_t + U_o h_{t-1} + b_o) \\
+\widetilde{c}_t &= \tanh(W_c x_t + U_c h_{t-1} + b_c) \\
+c_t &= f_t\odot c_{t-1} + i_t\odot \widetilde{c}_t \\
+h_t &= o_t\odot\tanh(c_t)
+\end{aligned}
+$$
+
+推导意义：通过输入门/遗忘门/输出门控制记忆保留与更新，缓解长依赖下梯度消失。
+
+项目实现功能：
+- 在 `model/fl_woa_cnn_lstm/cnn_lstm_model.py` 中采用双层 LSTM 做最终分类特征建模。
+
+### 4. PrivBox（隐私保护）
+
+PrivBox 在本项目由“秘密共享 + 差分隐私噪声 + 安全聚合”组成。
+
+加法秘密共享：
+
+$$
+s=\sum_{k=1}^{K}s_k
+$$
+
+高斯差分隐私机制：
+
+$$
+\widetilde{g}=g+\mathcal{N}(0,\sigma^2I),\quad
+\sigma=\frac{\sqrt{2\ln(1.25/\delta)}\,\Delta}{\epsilon}
+$$
+
+可选嵌入噪声：
+
+$$
+\widetilde{z}=z+\operatorname{Laplace}(0,b)
+$$
+
+安全重构聚合：
+
+$$
+g=\sum_{k=1}^{K}g_k
+$$
+
+项目实现功能：
+- `VFL/federated_learning/privbox.py`
+- 关键接口：`share_tensor`、`reconstruct_tensor`、`add_dp_noise`、`secure_compute_embedding`
+- 在 `VFL/federated_learning/vfl_server.py` 中接入训练流程
+
+### 5. 端到端流程（训练视角）
+
+1. 数据预处理后按特征维度垂直切分。
+2. 各方底层网络输出本地嵌入。
+3. 服务器聚合嵌入并完成顶层分类。
+4. 反向传播后按嵌入切片将梯度返回各方。
+5. 各方更新本地参数，循环迭代直到收敛。
+6. PrivBox 在聚合与梯度阶段提供隐私保护。
+
 ## 查看可用网络接口
 
 ### macOS/Linux

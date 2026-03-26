@@ -47,16 +47,7 @@ X_train, y_train = processor.fit_transform(train_df)
 X_test, y_test = processor.transform(test_df)
 ```
 
-### 3. `quick_start.py` - 快速入门脚本
-快速开始使用数据处理模块，展示完整的数据加载和处理流程。
-
-**运行：**
-```bash
-cd /Users/lyll/Documents/class/毕设/RecognitionAndPrediction
-python3 data/quick_start.py
-```
-
-### 4. `save_load_data.py` - 数据保存和加载工具
+### 3. `save_load_data.py` - 数据保存和加载工具
 处理并保存数据，或加载已处理的数据用于模型训练。
 
 **使用：**
@@ -80,7 +71,6 @@ data/
 ├── processed_data/                 # 处理后的数据保存位置
 ├── data_processing.py              # 基础处理函数
 ├── data_processor.py               # 数据处理器类（推荐）
-├── quick_start.py                  # 快速入门脚本
 └── save_load_data.py               # 保存/加载工具
 ```
 
@@ -187,10 +177,10 @@ np.save('data/processed_data/test_labels.npy', y_test)
 ## 下一步
 
 数据准备完成后，可以：
-1. 使用图像数据训练CNN-LSTM模型 (`model/woa_cnn_lstm/`)
-2. 实现WOA优化器进行超参数优化
-3. 构建垂直联邦学习框架 (`model/vfl_model/`)
-4. 在GUI中展示实时检测结果 (`gui/`)
+1. 使用图像数据训练 CNN-LSTM 模型（`model/fl_woa_cnn_lstm/cnn_lstm_model.py`）
+2. 训练垂直联邦学习模型（`VFL/train_vfl.py`）
+3. 启动实时检测与可视化（`VFL/realtime_monitor.py` 或 `VFL/run_monitor_gui.py`）
+4. 运行测试脚本评估效果（`test/performance_test.py`、`test/scene_test.py`）
 
 ## 依赖包
 
